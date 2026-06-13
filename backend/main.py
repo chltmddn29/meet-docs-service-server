@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import Base, engine
 from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave
-from routers import meetings, stt, audio, ai, markdown
+from routers import meetings, stt, audio, ai, markdown, pdf, docx
 
 
 # 데이터베이스 테이블 생성
@@ -15,6 +15,8 @@ app.include_router(audio.router)
 app.include_router(stt.router)
 app.include_router(ai.router)
 app.include_router(markdown.router)
+app.include_router(pdf.router)
+app.include_router(docx.router)
 
 # CORS 설정
 app.add_middleware(

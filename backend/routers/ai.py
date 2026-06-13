@@ -60,6 +60,17 @@ def analyze_meeting(meeting_id: int, db: Session = Depends(get_db)):
 
         agenda_items = json.loads(response_text)
 
+        if not agenda_items:
+            raise HTTPException(
+                status_code=400,
+                detail="분석할 내용이 부족합니다 (녹음이 너무 짧거나 비어있음)"
+            )
+
+        db.query(MeetingAgendaItem).filter(
+            MeetingAgendaItem.meeting_id == meeting_id
+        ).delete()
+        db.commit()
+
         for idx, item in enumerate(agenda_items):
             db.add(MeetingAgendaItem(
                 meeting_id=meeting_id,
@@ -78,6 +89,8 @@ def analyze_meeting(meeting_id: int, db: Session = Depends(get_db)):
             "agenda_items": agenda_items
         }
 
+    except HTTPException:
+        raise
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="AI 응답 파싱 실패")
     except Exception as e:
