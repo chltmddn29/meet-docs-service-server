@@ -5,3 +5,7 @@ sqlalchemy==2.0.36
 pydantic==2.10.0
 python-multipart==0.0.12
 python-dotenv==1.0.0
+reportlab
+python-docx
+notion-client
+psycopg2-binary
