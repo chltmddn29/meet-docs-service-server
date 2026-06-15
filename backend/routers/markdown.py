@@ -3,13 +3,14 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 
 router = APIRouter(prefix="/api/meetings", tags=["markdown"])
 
 MARKDOWN_DIR = "markdown"
+KST = timezone(timedelta(hours=9))  # 한국 시간
 
 
 @router.post("/{meeting_id}/save-markdown")
@@ -30,10 +31,14 @@ def save_markdown(meeting_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="No agenda items found")
 
     try:
-        now = datetime.now()
+        # 회의 생성 시각(UTC 저장) → 한국 시간 변환
+        created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+
         md_content = f"# {meeting.title}\n\n"
-        md_content += f"> 📅 {now.strftime('%Y-%m-%d %H:%M')}\n\n"
-        md_content += "---\n\n"
+        md_content += f"> 📅 {created.strftime('%Y-%m-%d %H:%M')}\n>\n"
+        if meeting.participants:
+            md_content += f"> 👥 참석자: {meeting.participants}\n"
+        md_content += "\n---\n\n"
 
         for item in agenda_items:
             md_content += f"## {item.order}. {item.agenda}\n\n"
@@ -55,6 +60,7 @@ def save_markdown(meeting_id: int, db: Session = Depends(get_db)):
             md_content += "---\n\n"
 
         os.makedirs(MARKDOWN_DIR, exist_ok=True)
+        now = datetime.now()
         filename = f"meeting_{meeting_id}_{now.strftime('%Y%m%d_%H%M%S')}.md"
         file_path = f"{MARKDOWN_DIR}/{filename}"
 

@@ -25,6 +25,7 @@ class Meeting(Base):
     meeting_date = Column(DateTime, nullable=True)
     duration = Column(Integer, nullable=True)
     status = Column(String, default="recording")
+    participants = Column(Text, nullable=True)
     tags = Column(Text, nullable=True)
     
     creator = relationship("User", back_populates="meetings")
@@ -56,7 +57,7 @@ class MeetingAgendaItem(Base):
     content = Column(Text, nullable=True)
     decision = Column(Text, nullable=True)
     action_items = Column(Text, nullable=True)
-    participant = Column(String, nullable=True)
+    participants = Column(Text, nullable=True)
     
     meeting = relationship("Meeting", back_populates="agenda_items")
 

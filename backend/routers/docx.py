@@ -3,16 +3,16 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 
 from docx import Document
-from docx.shared import Pt
 
 router = APIRouter(prefix="/api/meetings", tags=["docx"])
 
 DOCX_DIR = "docx"
+KST = timezone(timedelta(hours=9))  # 한국 시간
 
 
 @router.post("/{meeting_id}/save-docx")
@@ -33,11 +33,19 @@ def save_docx(meeting_id: int, db: Session = Depends(get_db)):
     filename = f"meeting_{meeting_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
     file_path = f"{DOCX_DIR}/{filename}"
 
+    # 회의 생성 시각(UTC 저장) → 한국 시간 변환
+    created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+    date_str = created.strftime("%Y-%m-%d %H:%M")
+
     doc = Document()
 
-    # 제목
+    # 제목 + 날짜 + 참석자
     doc.add_heading(meeting.title, level=0)
-    doc.add_paragraph(datetime.now().strftime("%Y-%m-%d %H:%M"))
+    doc.add_paragraph(f"📅 {date_str}")
+    if meeting.participants:
+        p = doc.add_paragraph()
+        p.add_run("👥 참석자: ").bold = True
+        p.add_run(meeting.participants)
 
     # 안건
     for item in items:

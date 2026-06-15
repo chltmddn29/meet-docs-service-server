@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 
@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/meetings", tags=["pdf"])
 
 PDF_DIR = "pdf"
 FONT_PATH = "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
+KST = timezone(timedelta(hours=9))  # 한국 시간
 
 # 한글 폰트 등록 (한 번만)
 pdfmetrics.registerFont(TTFont("Korean", FONT_PATH))
@@ -40,6 +41,10 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
     filename = f"meeting_{meeting_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     file_path = f"{PDF_DIR}/{filename}"
 
+    # 회의 생성 시각(UTC 저장) → 한국 시간 변환
+    created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+    date_str = created.strftime("%Y-%m-%d %H:%M")
+
     c = canvas.Canvas(file_path, pagesize=A4)
     width, height = A4
     y = height - 30 * mm
@@ -53,9 +58,13 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
         c.drawString(25 * mm, y, text)
         y -= gap * mm
 
-    # 제목
+    # 제목 + 날짜 + 참석자
     line(meeting.title, size=18, gap=10)
-    line(datetime.now().strftime("%Y-%m-%d %H:%M"), size=10, gap=10)
+    line(date_str, size=10, gap=6)
+    if meeting.participants:
+        line(f"참석자: {meeting.participants}", size=10, gap=10)
+    else:
+        y -= 4 * mm
 
     # 안건
     for item in items:

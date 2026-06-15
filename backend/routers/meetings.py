@@ -12,6 +12,7 @@ router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 class MeetingCreate(BaseModel):
     title: str
     agenda: list[str] = []
+    participants: list[str] = []
     created_by: int = None
 
 
@@ -25,7 +26,7 @@ class MeetingResponse(BaseModel):
         from_attributes = True
 
 
-# 1. 회의 생성 (안건도 함께 저장)
+# 1. 회의 생성 (안건 + 참석자 함께 저장)
 @router.post("", response_model=MeetingResponse)
 def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
     """새 회의 생성"""
@@ -33,6 +34,7 @@ def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
         title=meeting.title,
         status="recording",
         created_by=meeting.created_by,
+        participants=", ".join(meeting.participants) if meeting.participants else None,
     )
     db.add(db_meeting)
     db.commit()
@@ -41,12 +43,11 @@ def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
     # 입력한 안건 저장 (녹음 화면 참고용)
     for idx, agenda_text in enumerate(meeting.agenda):
         if agenda_text.strip():
-            item = MeetingAgendaItem(
+            db.add(MeetingAgendaItem(
                 meeting_id=db_meeting.meeting_id,
                 agenda=agenda_text,
                 order=idx + 1,
-            )
-            db.add(item)
+            ))
     db.commit()
 
     return db_meeting
@@ -56,14 +57,13 @@ def create_meeting(meeting: MeetingCreate, db: Session = Depends(get_db)):
 @router.get("")
 def get_meetings(db: Session = Depends(get_db)):
     """모든 회의 조회"""
-    meetings = db.query(Meeting).all()
-    return meetings
+    return db.query(Meeting).all()
 
 
-# 3. 특정 회의 상세 조회 (안건 포함)
+# 3. 특정 회의 상세 조회 (안건 + 참석자 포함)
 @router.get("/{meeting_id}")
 def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
-    """특정 회의 조회 (안건 포함)"""
+    """특정 회의 조회"""
     meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -78,6 +78,7 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
         "status": meeting.status,
         "created_at": meeting.created_at.isoformat(),
         "duration": meeting.duration,
+        "participants": meeting.participants,
         "agenda_items": [
             {
                 "item_id": i.item_id,
