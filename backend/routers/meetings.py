@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Meeting, MeetingAgendaItem
+from models import Meeting, MeetingAgendaItem, Transcript
 from pydantic import BaseModel
 from datetime import datetime
 import json
@@ -60,7 +60,7 @@ def get_meetings(db: Session = Depends(get_db)):
     return db.query(Meeting).all()
 
 
-# 3. 특정 회의 상세 조회 (안건 + 참석자 포함)
+# 3. 특정 회의 상세 조회 (안건 + 참석자 + 원본 텍스트 포함)
 @router.get("/{meeting_id}")
 def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
     """특정 회의 조회"""
@@ -72,6 +72,12 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
         MeetingAgendaItem.meeting_id == meeting_id
     ).order_by(MeetingAgendaItem.order).all()
 
+    # 원본 STT 텍스트
+    transcript = db.query(Transcript).filter(
+        Transcript.meeting_id == meeting_id
+    ).first()
+    raw_text = transcript.raw_text if transcript else None
+
     return {
         "meeting_id": meeting.meeting_id,
         "title": meeting.title,
@@ -79,6 +85,7 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
         "created_at": meeting.created_at.isoformat(),
         "duration": meeting.duration,
         "participants": meeting.participants,
+        "raw_text": raw_text,
         "agenda_items": [
             {
                 "item_id": i.item_id,
