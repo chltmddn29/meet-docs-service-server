@@ -9,47 +9,37 @@ router = APIRouter(prefix="/api/meetings", tags=["stt"])
 
 
 def correct_transcription(text: str) -> str:
-    """STT 결과 보정 (영어 음차 + 한국어 오류).
-
-    현재 미사용: 과보정으로 멀쩡한 내용이 왜곡되는 문제가 있어 process_audio에서
-    호출하지 않음. 필요하면 다시 호출하면 됨.
+    """STT 결과를 '말하려던 것'으로 다듬기: 영어 기술용어 음차 → 올바른 영어 표기
+    + 명백한 오인식 교정. 화자가 말한 의미는 보존하고 새 내용은 지어내지 않는다.
     """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {
                 "role": "system",
-                "content": """당신은 STT(음성인식) 결과를 보정하는 AI입니다.
-다음 2가지를 수정해주세요:
+                "content": """당신은 한국어 회의 STT(음성인식) 결과를 다듬는 편집자입니다.
+화자가 말하려던 바를 읽기 쉽게 정리하되, 아래 규칙을 엄격히 지키세요.
 
-1. 영어 단어의 한국어 음차 표기를 원래 영어로 변환
-예시:
-- "리버파드" → "Riverpod"
-- "플러터" → "Flutter"
-- "깃허브" → "GitHub"
-- "자바스크립트" → "JavaScript"
-- "리액트" → "React"
-- "패스트에이피아이" → "FastAPI"
+[교정할 것]
+1. 영어 기술용어·브랜드·제품명의 한글 음차를 올바른 영어 표기로 변환
+   예) "패스트 API"/"패스트에이피아이" → "FastAPI", "리버파드" → "Riverpod",
+       "플러터" → "Flutter", "리액트" → "React", "깃허브" → "GitHub",
+       "자바스크립트" → "JavaScript"
+2. 명백한 STT 오인식(잘못된 조사·발음)만 자연스럽게 교정
+   예) "후로" → "으로", "햇습니다" → "했습니다"
+3. 말 더듬기·중복·군더더기는 정리해 읽기 쉽게
 
-2. 한국어 STT 오류 교정 (잘못 인식된 조사, 발음 오류 등)
-예시:
-- "후로" → "으로"
-- "데" → "에"
-- "이써" → "있어"
-- "햇습니다" → "했습니다"
-
-규칙:
-1. 한국어 문장 구조는 그대로 유지
-2. 명백히 영어인 기술 용어, 브랜드명만 영어로 변환
-3. 잘못된 한국어 조사, 발음만 교정
-4. 원본 텍스트만 반환 (설명 없이)"""
+[금지]
+- 내용을 추가/삭제/요약/재구성하지 말 것. 화자가 말한 의미를 그대로 보존.
+- 없는 정보를 지어내지 말 것. 애매하면 원문을 유지.
+- 교정된 본문만 출력(설명·머리말 없이)."""
             },
             {
                 "role": "user",
                 "content": f"다음 텍스트를 보정해주세요:\n{text}"
             }
         ],
-        temperature=0.1,
+        temperature=0,
     )
     return response.choices[0].message.content.strip()
 
@@ -80,15 +70,17 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
 
         raw_text = result.strip() if isinstance(result, str) else str(result)
 
-        # 환각/과보정 방지를 위해 LLM 보정 단계는 끔. Whisper 결과를 그대로 저장.
-        transcript.raw_text = raw_text
+        # 들린 그대로가 아니라 '말하려던 것'으로 다듬기 (음차 영어 → 올바른 표기 등)
+        cleaned = correct_transcription(raw_text) if raw_text else raw_text
+
+        transcript.raw_text = cleaned
         db.commit()
         db.refresh(transcript)
 
         return {
             "meeting_id": meeting_id,
             "status": "completed",
-            "raw_text": raw_text,
+            "raw_text": cleaned,
             "original_text": raw_text,
         }
 
