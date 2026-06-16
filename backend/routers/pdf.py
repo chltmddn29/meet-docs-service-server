@@ -16,8 +16,12 @@ from reportlab.pdfbase.ttfonts import TTFont
 router = APIRouter(prefix="/api/meetings", tags=["pdf"])
 
 PDF_DIR = "pdf"
-FONT_PATH = "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
-KST = timezone(timedelta(hours=9))  # 한국 시간
+KST = timezone(timedelta(hours=9))
+
+# 폰트 경로: 맥이면 시스템 폰트, 리눅스(Render)면 동봉 폰트
+_MAC_FONT = "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
+_BUNDLED_FONT = os.path.join(os.path.dirname(__file__), '..', 'fonts', 'NanumGothic.ttf')
+FONT_PATH = _MAC_FONT if os.path.exists(_MAC_FONT) else _BUNDLED_FONT
 
 # 한글 폰트 등록 (한 번만)
 pdfmetrics.registerFont(TTFont("Korean", FONT_PATH))
@@ -41,7 +45,6 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
     filename = f"meeting_{meeting_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
     file_path = f"{PDF_DIR}/{filename}"
 
-    # 회의 생성 시각(UTC 저장) → 한국 시간 변환
     created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
     date_str = created.strftime("%Y-%m-%d %H:%M")
 
@@ -51,7 +54,7 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
 
     def line(text, size=11, gap=7, bold=False):
         nonlocal y
-        if y < 30 * mm:  # 페이지 넘침 처리
+        if y < 30 * mm:
             c.showPage()
             y = height - 30 * mm
         c.setFont("Korean", size)
@@ -79,7 +82,6 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
 
     c.save()
 
-    # DB 기록
     db.add(PlatformSave(
         meeting_id=meeting_id,
         platform="pdf",
