@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Transcript
+from models import Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client
 import os
 
@@ -57,6 +57,22 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
     if not os.path.exists(transcript.audio_file_path):
         raise HTTPException(status_code=404, detail="Audio file does not exist")
 
+    # 회의 맥락(제목·안건·참석자)을 프롬프트로 주입 → 용어·이름 인식 정확도↑
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+    agenda_items = db.query(MeetingAgendaItem).filter(
+        MeetingAgendaItem.meeting_id == meeting_id
+    ).order_by(MeetingAgendaItem.order).all()
+
+    prompt_parts = ["한국어로 진행된 회의 녹음입니다."]
+    if meeting and meeting.title:
+        prompt_parts.append(f"회의 제목: {meeting.title}.")
+    agenda_text = ", ".join(a.agenda for a in agenda_items if a.agenda)
+    if agenda_text:
+        prompt_parts.append(f"주요 안건: {agenda_text}.")
+    if meeting and meeting.participants:
+        prompt_parts.append(f"참석자: {meeting.participants}.")
+    whisper_prompt = " ".join(prompt_parts)
+
     try:
         with open(transcript.audio_file_path, "rb") as audio_file:
             result = client.audio.transcriptions.create(
@@ -65,7 +81,7 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
                 language="ko",
                 response_format="text",
                 temperature=0,                      # 결정적 출력 → 환각 감소
-                prompt="한국어로 진행된 회의 녹음입니다. 회의 안건, 논의 내용, 결정 사항, 할 일이 포함됩니다.",
+                prompt=whisper_prompt,              # 회의 맥락 주입 → 용어/이름 정확도↑
             )
 
         raw_text = result.strip() if isinstance(result, str) else str(result)
