@@ -8,16 +8,28 @@ import os
 router = APIRouter(prefix="/api/meetings", tags=["stt"])
 
 
-def correct_transcription(text: str) -> str:
+def correct_transcription(text: str, meeting_title: str = "", agenda_list: str = "",
+                          participants: str = "") -> str:
     """STT 결과를 '말하려던 것'으로 다듬기: 영어 기술용어 음차 → 올바른 영어 표기
-    + 명백한 오인식 교정. 화자가 말한 의미는 보존하고 새 내용은 지어내지 않는다.
+    + 회의 맥락 기반 용어 교정. 화자가 말한 의미는 보존하고 새 내용은 지어내지 않는다.
+
+    Args:
+        text: STT 원본 텍스트
+        meeting_title: 회의 제목 (컨텍스트용)
+        agenda_list: 안건 목록 (쉼표 구분, 컨텍스트용)
+        participants: 참석자 (쉼표 구분, 컨텍스트용)
     """
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {
-                "role": "system",
-                "content": """당신은 한국어 회의 STT(음성인식) 결과를 다듬는 편집자입니다.
+    # 회의 맥락을 프롬프트에 포함
+    context_parts = []
+    if meeting_title:
+        context_parts.append(f"회의 제목: {meeting_title}")
+    if agenda_list:
+        context_parts.append(f"안건: {agenda_list}")
+    if participants:
+        context_parts.append(f"참석자: {participants}")
+    context_str = "\n".join(context_parts)
+
+    system_prompt = """당신은 한국어 회의 STT(음성인식) 결과를 다듬는 편집자입니다.
 화자가 말하려던 바를 읽기 쉽게 정리하되, 아래 규칙을 엄격히 지키세요.
 
 [교정할 것]
@@ -28,11 +40,22 @@ def correct_transcription(text: str) -> str:
 2. 명백한 STT 오인식(잘못된 조사·발음)만 자연스럽게 교정
    예) "후로" → "으로", "햇습니다" → "했습니다"
 3. 말 더듬기·중복·군더더기는 정리해 읽기 쉽게
+4. 회의 맥락에 맞는 도메인 용어를 올바르게 교정 (아래 회의 정보 참고)
 
 [금지]
 - 내용을 추가/삭제/요약/재구성하지 말 것. 화자가 말한 의미를 그대로 보존.
 - 없는 정보를 지어내지 말 것. 애매하면 원문을 유지.
-- 교정된 본문만 출력(설명·머리말 없이)."""
+- 교정된 본문만 출력(설명·머리말 없이).
+
+[회의 정보]
+""" + (context_str if context_str else "(맥락 정보 없음)")
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": system_prompt
             },
             {
                 "role": "user",
@@ -86,8 +109,19 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
 
         raw_text = result.strip() if isinstance(result, str) else str(result)
 
-        # 들린 그대로가 아니라 '말하려던 것'으로 다듬기 (음차 영어 → 올바른 표기 등)
-        cleaned = correct_transcription(raw_text) if raw_text else raw_text
+        # 들린 그대로가 아니라 '말하려던 것'으로 다듬기
+        # 회의 맥락(제목·안건·참석자)을 LLM에 넘겨 도메인 용어를 제대로 교정
+        agenda_str = ", ".join(a.agenda for a in agenda_items if a.agenda)
+        cleaned = (
+            correct_transcription(
+                raw_text,
+                meeting_title=meeting.title if meeting else "",
+                agenda_list=agenda_str,
+                participants=meeting.participants if meeting else "",
+            )
+            if raw_text
+            else raw_text
+        )
 
         transcript.raw_text = cleaned
         db.commit()
