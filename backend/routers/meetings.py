@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from models import Meeting, MeetingAgendaItem, Transcript
+from models import Meeting, MeetingAgendaItem, Transcript, PlatformSave
 from pydantic import BaseModel
 from datetime import datetime
 import json
-from routers.groq_client import client as groq_client
+import os
+from routers.ai import analyze_and_save
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
@@ -113,107 +114,49 @@ def update_and_reanalyze(meeting_id: int, body: RawTextUpdate, db: Session = Dep
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
-    # 1. 텍스트 저장
+    # 입력 검증 (공백만 있는 경우도 거부)
+    raw_text = (body.raw_text or "").strip()
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="수정할 텍스트가 비어있습니다")
+
+    # 1. 텍스트 저장 (없으면 새 transcript 생성)
     transcript = db.query(Transcript).filter(
         Transcript.meeting_id == meeting_id
-    ).first()
-    if transcript:
-        transcript.raw_text = body.raw_text
-        db.commit()
-
-    # 2. 다시 정리: 수정된 텍스트로 AI 분석
-    if not body.raw_text:
-        raise HTTPException(status_code=400, detail="Raw text is empty")
-
+    ).order_by(Transcript.transcript_id.desc()).first()
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "당신은 회의록을 분석하는 AI입니다. 반드시 순수 JSON 배열만 응답하세요. 마크다운 코드블록이나 다른 텍스트는 절대 포함하지 마세요."
-                },
-                {
-                    "role": "user",
-                    "content": f"""다음 회의 내용을 분석해서 JSON 배열 형식으로 반환해주세요.
-
-각 항목의 형식:
-{{
-  "agenda": "안건명",
-  "content": "논의된 내용",
-  "decision": "결정사항",
-  "action_items": ["할 일 1", "할 일 2"]
-}}
-
-회의 내용:
-{body.raw_text}
-"""
-                }
-            ],
-            temperature=0.3,
-        )
-
-        response_text = response.choices[0].message.content.strip()
-
-        if "```" in response_text:
-            response_text = response_text.split("```")[1]
-            if response_text.startswith("json"):
-                response_text = response_text[4:]
-            response_text = response_text.strip()
-
-        agenda_items = json.loads(response_text)
-
-        if not agenda_items:
-            raise HTTPException(
-                status_code=400,
-                detail="분석할 내용이 부족합니다"
-            )
-
-        # 3. 기존 agenda items 삭제 후 새로 저장
-        db.query(MeetingAgendaItem).filter(
-            MeetingAgendaItem.meeting_id == meeting_id
-        ).delete()
+        if transcript:
+            transcript.raw_text = raw_text
+        else:
+            transcript = Transcript(meeting_id=meeting_id, raw_text=raw_text)
+            db.add(transcript)
         db.commit()
-
-        for idx, item in enumerate(agenda_items):
-            db.add(MeetingAgendaItem(
-                meeting_id=meeting_id,
-                agenda=item.get("agenda", ""),
-                order=idx + 1,
-                content=item.get("content", ""),
-                decision=item.get("decision", ""),
-                action_items=json.dumps(item.get("action_items", []), ensure_ascii=False),
-            ))
-
-        db.commit()
-
-        # 기존 저장된 파일들 삭제 (마크다운, PDF, Word) → 다음 다운로드 시 새로 생성되도록
-        import os
-        from pathlib import Path
-        from models import PlatformSave
-
-        saved_files = db.query(PlatformSave).filter(
-            PlatformSave.meeting_id == meeting_id,
-            PlatformSave.platform.in_(["markdown", "pdf", "docx"])
-        ).all()
-
-        for saved in saved_files:
-            try:
-                if os.path.exists(saved.platform_doc_id):
-                    os.remove(saved.platform_doc_id)
-            except Exception:
-                pass
-            db.delete(saved)
-        db.commit()
-
-        return {
-            "meeting_id": meeting_id,
-            "status": "reanalyzed",
-            "raw_text": body.raw_text,
-            "agenda_items": agenda_items
-        }
-
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI 응답 파싱 실패")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"텍스트 저장 실패: {e}")
+
+    # 2. 공용 분석 로직으로 안건 재생성 (견고한 파싱 + 트랜잭션 안전)
+    agenda_items = analyze_and_save(meeting_id, raw_text, db)
+
+    # 3. 기존 저장 파일(md/pdf/docx) 삭제 → 다음 다운로드 시 최신본 재생성
+    saved_files = db.query(PlatformSave).filter(
+        PlatformSave.meeting_id == meeting_id,
+        PlatformSave.platform.in_(["markdown", "pdf", "docx"]),
+    ).all()
+    for saved in saved_files:
+        try:
+            if saved.platform_doc_id and os.path.exists(saved.platform_doc_id):
+                os.remove(saved.platform_doc_id)
+        except OSError:
+            pass  # 파일 삭제 실패는 무시 (DB 레코드만 정리)
+        db.delete(saved)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()  # 파일 레코드 정리 실패는 치명적이지 않음
+
+    return {
+        "meeting_id": meeting_id,
+        "status": "reanalyzed",
+        "raw_text": raw_text,
+        "agenda_items": agenda_items,
+    }
