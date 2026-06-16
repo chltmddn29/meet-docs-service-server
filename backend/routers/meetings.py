@@ -5,6 +5,7 @@ from models import Meeting, MeetingAgendaItem, Transcript
 from pydantic import BaseModel
 from datetime import datetime
 import json
+from routers.groq_client import client as groq_client
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
@@ -14,6 +15,10 @@ class MeetingCreate(BaseModel):
     agenda: list[str] = []
     participants: list[str] = []
     created_by: int = None
+
+
+class RawTextUpdate(BaseModel):
+    raw_text: str
 
 
 class MeetingResponse(BaseModel):
@@ -98,3 +103,98 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
             for i in items
         ],
     }
+
+
+# 4. 원본 텍스트 수정 + 다시 정리
+@router.put("/{meeting_id}/raw-text")
+def update_and_reanalyze(meeting_id: int, body: RawTextUpdate, db: Session = Depends(get_db)):
+    """원본 STT 텍스트를 사용자가 수정하고 저장 → AI가 다시 정리"""
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
+    # 1. 텍스트 저장
+    transcript = db.query(Transcript).filter(
+        Transcript.meeting_id == meeting_id
+    ).first()
+    if transcript:
+        transcript.raw_text = body.raw_text
+        db.commit()
+
+    # 2. 다시 정리: 수정된 텍스트로 AI 분석
+    if not body.raw_text:
+        raise HTTPException(status_code=400, detail="Raw text is empty")
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "당신은 회의록을 분석하는 AI입니다. 반드시 순수 JSON 배열만 응답하세요. 마크다운 코드블록이나 다른 텍스트는 절대 포함하지 마세요."
+                },
+                {
+                    "role": "user",
+                    "content": f"""다음 회의 내용을 분석해서 JSON 배열 형식으로 반환해주세요.
+
+각 항목의 형식:
+{{
+  "agenda": "안건명",
+  "content": "논의된 내용",
+  "decision": "결정사항",
+  "action_items": ["할 일 1", "할 일 2"]
+}}
+
+회의 내용:
+{body.raw_text}
+"""
+                }
+            ],
+            temperature=0.3,
+        )
+
+        response_text = response.choices[0].message.content.strip()
+
+        if "```" in response_text:
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+
+        agenda_items = json.loads(response_text)
+
+        if not agenda_items:
+            raise HTTPException(
+                status_code=400,
+                detail="분석할 내용이 부족합니다"
+            )
+
+        # 3. 기존 agenda items 삭제 후 새로 저장
+        db.query(MeetingAgendaItem).filter(
+            MeetingAgendaItem.meeting_id == meeting_id
+        ).delete()
+        db.commit()
+
+        for idx, item in enumerate(agenda_items):
+            db.add(MeetingAgendaItem(
+                meeting_id=meeting_id,
+                agenda=item.get("agenda", ""),
+                order=idx + 1,
+                content=item.get("content", ""),
+                decision=item.get("decision", ""),
+                action_items=json.dumps(item.get("action_items", []), ensure_ascii=False),
+            ))
+
+        db.commit()
+
+        return {
+            "meeting_id": meeting_id,
+            "status": "reanalyzed",
+            "raw_text": body.raw_text,
+            "agenda_items": agenda_items
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="AI 응답 파싱 실패")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
