@@ -9,7 +9,11 @@ router = APIRouter(prefix="/api/meetings", tags=["stt"])
 
 
 def correct_transcription(text: str) -> str:
-    """STT 결과 보정 (영어 음차 + 한국어 오류)"""
+    """STT 결과 보정 (영어 음차 + 한국어 오류).
+
+    현재 미사용: 과보정으로 멀쩡한 내용이 왜곡되는 문제가 있어 process_audio에서
+    호출하지 않음. 필요하면 다시 호출하면 됨.
+    """
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -67,23 +71,25 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
         with open(transcript.audio_file_path, "rb") as audio_file:
             result = client.audio.transcriptions.create(
                 file=audio_file,
-                model="whisper-large-v3-turbo",
+                model="whisper-large-v3",          # turbo보다 정확 (특히 한국어)
                 language="ko",
-                response_format="text"
+                response_format="text",
+                temperature=0,                      # 결정적 출력 → 환각 감소
+                prompt="한국어로 진행된 회의 녹음입니다. 회의 안건, 논의 내용, 결정 사항, 할 일이 포함됩니다.",
             )
 
-        raw_text = result
-        corrected_text = correct_transcription(raw_text)
+        raw_text = result.strip() if isinstance(result, str) else str(result)
 
-        transcript.raw_text = corrected_text
+        # 환각/과보정 방지를 위해 LLM 보정 단계는 끔. Whisper 결과를 그대로 저장.
+        transcript.raw_text = raw_text
         db.commit()
         db.refresh(transcript)
 
         return {
             "meeting_id": meeting_id,
             "status": "completed",
-            "raw_text": corrected_text,
-            "original_text": raw_text
+            "raw_text": raw_text,
+            "original_text": raw_text,
         }
 
     except Exception as e:
