@@ -59,11 +59,33 @@ async def upload_audio(
         raise HTTPException(status_code=500, detail=f"저장 실패: {e}")
 
 
-# 2. 음성 파일 목록 조회
+# 2. 음성 파일 목록 조회 — 실제 재생 가능한 것만 반환
 @router.get("/audio-files")
 def get_audio_files(db: Session = Depends(get_db)):
-    """모든 음성 파일 조회"""
-    return db.query(Transcript).all()
+    """오디오가 실제로 존재하는 기록만 조회.
+    DB 바이트가 있거나 디스크 파일이 남아있는 것만 노출 →
+    재시작으로 소실돼 복원 불가한 옛 기록은 목록에서 제외.
+    BLOB은 length()로 서버측에서만 확인(바이트 전송 안 함)."""
+    from sqlalchemy import func
+
+    rows = db.query(
+        Transcript.transcript_id,
+        Transcript.meeting_id,
+        Transcript.audio_file_path,
+        func.length(Transcript.audio_data).label("audio_len"),
+    ).all()
+
+    result = []
+    for r in rows:
+        has_db = (r.audio_len or 0) > 0
+        has_disk = bool(r.audio_file_path) and os.path.exists(r.audio_file_path)
+        if has_db or has_disk:
+            result.append({
+                "transcript_id": r.transcript_id,
+                "meeting_id": r.meeting_id,
+                "audio_file_path": r.audio_file_path or "",
+            })
+    return result
 
 
 # 3. 음성 스트리밍(재생) / 다운로드 — 디스크에 없으면 DB에서 복원
