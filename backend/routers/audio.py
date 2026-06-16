@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript
@@ -54,7 +55,31 @@ def get_audio_files(db: Session = Depends(get_db)):
     files = db.query(Transcript).all()
     return files
 
-# 3. 특정 음성 파일 삭제
+# 3. 음성 파일 재생(다운로드) — 브라우저에서 직접 재생
+@router.get("/audio-files/{transcript_id}/download")
+def download_audio_file(transcript_id: int, db: Session = Depends(get_db)):
+    """음성 파일 스트리밍 (재생용)"""
+    transcript = db.query(Transcript).filter(
+        Transcript.transcript_id == transcript_id
+    ).first()
+
+    if not transcript:
+        raise HTTPException(status_code=404, detail="Audio file not found")
+
+    if not os.path.exists(transcript.audio_file_path):
+        # Render 무료 플랜은 디스크가 휘발성이라 재시작 시 파일이 사라질 수 있음
+        raise HTTPException(
+            status_code=404,
+            detail="음성 파일이 더 이상 존재하지 않습니다 (서버 재시작으로 삭제됨)",
+        )
+
+    return FileResponse(
+        transcript.audio_file_path,
+        filename=os.path.basename(transcript.audio_file_path),
+    )
+
+
+# 4. 특정 음성 파일 삭제
 @router.delete("/audio-files/{transcript_id}")
 def delete_audio_file(transcript_id: int, db: Session = Depends(get_db)):
     """음성 파일 삭제"""
