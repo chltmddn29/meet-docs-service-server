@@ -78,18 +78,56 @@ def save_docx(meeting_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{meeting_id}/download-docx")
 def download_docx(meeting_id: int, db: Session = Depends(get_db)):
-    """DOCX 다운로드"""
-    save = db.query(PlatformSave).filter(
-        PlatformSave.meeting_id == meeting_id,
-        PlatformSave.platform == "docx",
-        PlatformSave.save_status == "success",
-    ).order_by(PlatformSave.saved_at.desc()).first()
+    """DOCX 다운로드 (없으면 자동 생성)"""
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if not save or not os.path.exists(save.platform_doc_id):
-        raise HTTPException(status_code=404, detail="DOCX file not found")
+    items = db.query(MeetingAgendaItem).filter(
+        MeetingAgendaItem.meeting_id == meeting_id
+    ).order_by(MeetingAgendaItem.order).all()
+
+    if not items:
+        raise HTTPException(status_code=400, detail="No agenda items found")
+
+    os.makedirs(DOCX_DIR, exist_ok=True)
+    filename = f"meeting_{meeting_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+    file_path = f"{DOCX_DIR}/{filename}"
+
+    # 회의 생성 시각(UTC 저장) → 한국 시간 변환
+    created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+    date_str = created.strftime("%Y-%m-%d %H:%M")
+
+    doc = Document()
+
+    # 제목 + 날짜 + 참석자
+    doc.add_heading(meeting.title, level=0)
+    doc.add_paragraph(f"📅 {date_str}")
+    if meeting.participants:
+        p = doc.add_paragraph()
+        p.add_run("👥 참석자: ").bold = True
+        p.add_run(meeting.participants)
+
+    # 안건
+    for item in items:
+        doc.add_heading(f"{item.order}. {item.agenda}", level=1)
+
+        if item.decision:
+            p = doc.add_paragraph()
+            p.add_run("결정: ").bold = True
+            p.add_run(item.decision)
+
+        if item.action_items:
+            actions = json.loads(item.action_items)
+            if actions:
+                doc.add_paragraph("할 일:").bold = True
+                for a in actions:
+                    doc.add_paragraph(a, style="List Bullet")
+
+    doc.save(file_path)
 
     return FileResponse(
-        path=save.platform_doc_id,
-        filename=os.path.basename(save.platform_doc_id),
+        path=file_path,
+        filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )

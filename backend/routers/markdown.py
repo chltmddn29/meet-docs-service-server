@@ -88,21 +88,63 @@ def save_markdown(meeting_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{meeting_id}/download-markdown")
 def download_markdown(meeting_id: int, db: Session = Depends(get_db)):
-    """마크다운 파일 다운로드"""
-    platform_save = db.query(PlatformSave).filter(
-        PlatformSave.meeting_id == meeting_id,
-        PlatformSave.platform == "markdown",
-        PlatformSave.save_status == "success"
-    ).order_by(PlatformSave.saved_at.desc()).first()
+    """마크다운 파일 다운로드 (없으면 자동 생성)"""
+    meeting = db.query(Meeting).filter(
+        Meeting.meeting_id == meeting_id
+    ).first()
 
-    if not platform_save:
-        raise HTTPException(status_code=404, detail="Markdown file not found")
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if not os.path.exists(platform_save.platform_doc_id):
-        raise HTTPException(status_code=404, detail="File does not exist")
+    agenda_items = db.query(MeetingAgendaItem).filter(
+        MeetingAgendaItem.meeting_id == meeting_id
+    ).order_by(MeetingAgendaItem.order).all()
 
-    return FileResponse(
-        path=platform_save.platform_doc_id,
-        filename=os.path.basename(platform_save.platform_doc_id),
-        media_type="text/markdown"
-    )
+    if not agenda_items:
+        raise HTTPException(status_code=400, detail="No agenda items found")
+
+    try:
+        # 회의 생성 시각(UTC 저장) → 한국 시간 변환
+        created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+
+        md_content = f"# {meeting.title}\n\n"
+        md_content += f"> 📅 {created.strftime('%Y-%m-%d %H:%M')}\n>\n"
+        if meeting.participants:
+            md_content += f"> 👥 참석자: {meeting.participants}\n"
+        md_content += "\n---\n\n"
+
+        for item in agenda_items:
+            md_content += f"## {item.order}. {item.agenda}\n\n"
+
+            if item.content:
+                md_content += f"**내용**\n{item.content}\n\n"
+
+            if item.decision:
+                md_content += f"**결정사항**\n{item.decision}\n\n"
+
+            if item.action_items:
+                action_list = json.loads(item.action_items)
+                if action_list:
+                    md_content += "**할 일**\n"
+                    for action in action_list:
+                        md_content += f"- [ ] {action}\n"
+                    md_content += "\n"
+
+            md_content += "---\n\n"
+
+        os.makedirs(MARKDOWN_DIR, exist_ok=True)
+        now = datetime.now()
+        filename = f"meeting_{meeting_id}_{now.strftime('%Y%m%d_%H%M%S')}.md"
+        file_path = f"{MARKDOWN_DIR}/{filename}"
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="text/markdown"
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

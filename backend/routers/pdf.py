@@ -95,18 +95,61 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
 
 @router.get("/{meeting_id}/download-pdf")
 def download_pdf(meeting_id: int, db: Session = Depends(get_db)):
-    """PDF 다운로드"""
-    save = db.query(PlatformSave).filter(
-        PlatformSave.meeting_id == meeting_id,
-        PlatformSave.platform == "pdf",
-        PlatformSave.save_status == "success",
-    ).order_by(PlatformSave.saved_at.desc()).first()
+    """PDF 다운로드 (없으면 자동 생성)"""
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
 
-    if not save or not os.path.exists(save.platform_doc_id):
-        raise HTTPException(status_code=404, detail="PDF file not found")
+    items = db.query(MeetingAgendaItem).filter(
+        MeetingAgendaItem.meeting_id == meeting_id
+    ).order_by(MeetingAgendaItem.order).all()
+
+    if not items:
+        raise HTTPException(status_code=400, detail="No agenda items found")
+
+    os.makedirs(PDF_DIR, exist_ok=True)
+    filename = f"meeting_{meeting_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    file_path = f"{PDF_DIR}/{filename}"
+
+    created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+    date_str = created.strftime("%Y-%m-%d %H:%M")
+
+    c = canvas.Canvas(file_path, pagesize=A4)
+    width, height = A4
+    y = height - 30 * mm
+
+    def line(text, size=11, gap=7, bold=False):
+        nonlocal y
+        if y < 30 * mm:
+            c.showPage()
+            y = height - 30 * mm
+        c.setFont("Korean", size)
+        c.drawString(25 * mm, y, text)
+        y -= gap * mm
+
+    # 제목 + 날짜 + 참석자
+    line(meeting.title, size=18, gap=10)
+    line(date_str, size=10, gap=6)
+    if meeting.participants:
+        line(f"참석자: {meeting.participants}", size=10, gap=10)
+    else:
+        y -= 4 * mm
+
+    # 안건
+    for item in items:
+        line(f"{item.order}. {item.agenda}", size=14, gap=8)
+        if item.decision:
+            line(f"  결정: {item.decision}", size=11, gap=6)
+        if item.action_items:
+            actions = json.loads(item.action_items)
+            for a in actions:
+                line(f"  - {a}", size=11, gap=6)
+        y -= 4 * mm
+
+    c.save()
 
     return FileResponse(
-        path=save.platform_doc_id,
-        filename=os.path.basename(save.platform_doc_id),
+        path=file_path,
+        filename=filename,
         media_type="application/pdf",
     )

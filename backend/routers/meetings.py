@@ -187,6 +187,25 @@ def update_and_reanalyze(meeting_id: int, body: RawTextUpdate, db: Session = Dep
 
         db.commit()
 
+        # 기존 저장된 파일들 삭제 (마크다운, PDF, Word) → 다음 다운로드 시 새로 생성되도록
+        import os
+        from pathlib import Path
+        from models import PlatformSave
+
+        saved_files = db.query(PlatformSave).filter(
+            PlatformSave.meeting_id == meeting_id,
+            PlatformSave.platform.in_(["markdown", "pdf", "docx"])
+        ).all()
+
+        for saved in saved_files:
+            try:
+                if os.path.exists(saved.platform_doc_id):
+                    os.remove(saved.platform_doc_id)
+            except Exception:
+                pass
+            db.delete(saved)
+        db.commit()
+
         return {
             "meeting_id": meeting_id,
             "status": "reanalyzed",
