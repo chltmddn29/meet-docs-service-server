@@ -55,10 +55,16 @@ def get_audio_files(db: Session = Depends(get_db)):
     files = db.query(Transcript).all()
     return files
 
-# 3. 음성 파일 재생(다운로드) — 브라우저에서 직접 재생
+# 3. 음성 파일 스트리밍/다운로드
+#    download=false(기본): inline → 브라우저에서 바로 재생
+#    download=true: attachment → 파일로 다운로드
 @router.get("/audio-files/{transcript_id}/download")
-def download_audio_file(transcript_id: int, db: Session = Depends(get_db)):
-    """음성 파일 스트리밍 (재생용)"""
+def download_audio_file(
+    transcript_id: int,
+    download: bool = False,
+    db: Session = Depends(get_db),
+):
+    """음성 파일 스트리밍(재생) 또는 다운로드"""
     transcript = db.query(Transcript).filter(
         Transcript.transcript_id == transcript_id
     ).first()
@@ -73,9 +79,15 @@ def download_audio_file(transcript_id: int, db: Session = Depends(get_db)):
             detail="음성 파일이 더 이상 존재하지 않습니다 (서버 재시작으로 삭제됨)",
         )
 
+    filename = os.path.basename(transcript.audio_file_path)
+    # inline=재생, attachment=다운로드
+    disposition = "attachment" if download else "inline"
     return FileResponse(
         transcript.audio_file_path,
-        filename=os.path.basename(transcript.audio_file_path),
+        media_type="audio/webm",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{filename}"'
+        },
     )
 
 
