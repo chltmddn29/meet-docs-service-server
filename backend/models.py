@@ -64,7 +64,7 @@ class MeetingAgendaItem(Base):
 
 class PlatformSave(Base):
     __tablename__ = "platform_saves"
-    
+
     save_id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, ForeignKey("meetings.meeting_id"))
     platform = Column(String)
@@ -72,5 +72,17 @@ class PlatformSave(Base):
     platform_doc_id = Column(String, nullable=True)
     saved_at = Column(DateTime, default=datetime.utcnow)
     error_message = Column(Text, nullable=True)
-    
+
     meeting = relationship("Meeting", back_populates="platform_saves")
+
+
+class Template(Base):
+    __tablename__ = "templates"
+
+    template_id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    description = Column(Text, nullable=True)
+    agenda_items = Column(Text, nullable=True)   # JSON 배열 문자열로 저장
+    participants = Column(Text, nullable=True)   # 쉼표 구분 문자열
+    created_by = Column(Integer, ForeignKey("users.user_id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
