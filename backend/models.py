@@ -86,3 +86,15 @@ class Template(Base):
     participants = Column(Text, nullable=True)   # 쉼표 구분 문자열
     created_by = Column(Integer, ForeignKey("users.user_id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class FormatTemplate(Base):
+    """업로드한 샘플 문서(서식). AI가 이 형식대로 회의록을 생성하는 데 사용."""
+    __tablename__ = "format_templates"
+
+    format_template_id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    content = Column(Text)                        # 업로드 파일에서 추출한 본문(서식 예시)
+    source_filename = Column(String, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.user_id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

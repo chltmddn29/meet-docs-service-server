@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import Base, engine
-from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, Template
-from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates
+from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, Template, FormatTemplate
+from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates
 
 
 # 데이터베이스 테이블 생성
@@ -20,6 +20,7 @@ app.include_router(docx.router)
 app.include_router(notion.router)
 app.include_router(preview.router)
 app.include_router(templates.router)
+app.include_router(format_templates.router)
 
 # CORS 설정
 # allow_origins=["*"] 와 allow_credentials=True 는 함께 쓸 수 없음(브라우저가 거부).
