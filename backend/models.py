@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, LargeBinary
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database import Base
@@ -40,6 +40,9 @@ class Transcript(Base):
     transcript_id = Column(Integer, primary_key=True, index=True)
     meeting_id = Column(Integer, ForeignKey("meetings.meeting_id"))
     audio_file_path = Column(String)
+    # 오디오 바이트를 DB에 보관 → Render 무료 디스크가 휘발성이어도 재시작 후 복원 가능
+    audio_data = Column(LargeBinary, nullable=True)
+    audio_filename = Column(String, nullable=True)
     raw_text = Column(Text, nullable=True)
     processed_text = Column(Text, nullable=True)
     generated_at = Column(DateTime, default=datetime.utcnow)

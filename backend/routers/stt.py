@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client, ensure_client
+from routers.audio_store import ensure_local_file
 import os
 import logging
 
@@ -79,16 +80,18 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
     if not transcript:
         raise HTTPException(status_code=404, detail="음성 파일이 없습니다")
 
-    if not transcript.audio_file_path or not os.path.exists(transcript.audio_file_path):
-        # Render 무료 디스크는 휘발성 → 재시작 시 파일 소실
+    # 디스크에 없으면 DB 바이트로 복원 (재시작 후에도 처리 가능)
+    audio_path = ensure_local_file(transcript)
+    if not audio_path:
         raise HTTPException(
             status_code=404,
-            detail="음성 파일이 더 이상 존재하지 않습니다 (서버 재시작으로 삭제됨)",
+            detail="음성 파일이 존재하지 않습니다 (데이터가 저장되지 않았습니다)",
         )
+    db.commit()  # 복원으로 audio_file_path가 갱신됐으면 반영
 
     # 파일 크기 검증 (빈 파일·과대 파일 사전 차단)
     try:
-        size = os.path.getsize(transcript.audio_file_path)
+        size = os.path.getsize(audio_path)
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"파일 접근 실패: {e}")
 
@@ -118,7 +121,7 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
 
     # 1) Whisper STT — 실패 시 원인별로 구분된 메시지
     try:
-        with open(transcript.audio_file_path, "rb") as audio_file:
+        with open(audio_path, "rb") as audio_file:
             result = client.audio.transcriptions.create(
                 file=audio_file,
                 model="whisper-large-v3",

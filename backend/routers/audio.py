@@ -3,109 +3,124 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript
+from routers.audio_store import save_audio, ensure_local_file
 from pydantic import BaseModel
-from datetime import datetime
 import os
-import shutil
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
-AUDIO_DIR = "audio"
+# Groq Whisper 무료 한도(25MB)에 맞춤 + DB 비대화 방지
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+
 
 class AudioResponse(BaseModel):
     transcript_id: int
     meeting_id: int
     audio_file_path: str
-    
+
     class Config:
         from_attributes = True
 
-# 1. 음성 파일 업로드
+
+# 1. 음성 파일 업로드 (DB + 디스크 동시 저장)
 @router.post("/meetings/{meeting_id}/upload-audio", response_model=AudioResponse)
 async def upload_audio(
     meeting_id: int,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """음성 파일 업로드"""
+    """음성 파일 업로드 — 바이트를 DB에 보관해 서버 재시작에도 유지."""
     try:
-        os.makedirs(AUDIO_DIR, exist_ok=True)
-        file_path = f"{AUDIO_DIR}/meeting_{meeting_id}_{file.filename}"
-        
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        transcript = Transcript(
-            meeting_id=meeting_id,
-            audio_file_path=file_path,
+        data = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+
+    if not data:
+        raise HTTPException(status_code=400, detail="빈 파일입니다 (0 bytes)")
+    if len(data) > MAX_AUDIO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"파일이 너무 큽니다 ({len(data)//(1024*1024)}MB, 최대 25MB)",
         )
+
+    try:
+        transcript = Transcript(meeting_id=meeting_id)
+        save_audio(transcript, data, file.filename or "audio.webm")
         db.add(transcript)
         db.commit()
         db.refresh(transcript)
-        
         return transcript
-    
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        db.rollback()
+        logger.exception("오디오 업로드 저장 실패")
+        raise HTTPException(status_code=500, detail=f"저장 실패: {e}")
 
-# 2. 음성 파일 목록 조회 (경로 변경!)
+
+# 2. 음성 파일 목록 조회
 @router.get("/audio-files")
 def get_audio_files(db: Session = Depends(get_db)):
     """모든 음성 파일 조회"""
-    files = db.query(Transcript).all()
-    return files
+    return db.query(Transcript).all()
 
-# 3. 음성 파일 스트리밍/다운로드
-#    download=false(기본): inline → 브라우저에서 바로 재생
-#    download=true: attachment → 파일로 다운로드
+
+# 3. 음성 스트리밍(재생) / 다운로드 — 디스크에 없으면 DB에서 복원
 @router.get("/audio-files/{transcript_id}/download")
 def download_audio_file(
     transcript_id: int,
     download: bool = False,
     db: Session = Depends(get_db),
 ):
-    """음성 파일 스트리밍(재생) 또는 다운로드"""
+    """download=false: inline 재생 / download=true: 파일 다운로드"""
     transcript = db.query(Transcript).filter(
         Transcript.transcript_id == transcript_id
     ).first()
 
     if not transcript:
-        raise HTTPException(status_code=404, detail="Audio file not found")
+        raise HTTPException(status_code=404, detail="음성 기록을 찾을 수 없습니다")
 
-    if not os.path.exists(transcript.audio_file_path):
-        # Render 무료 플랜은 디스크가 휘발성이라 재시작 시 파일이 사라질 수 있음
+    path = ensure_local_file(transcript)
+    if not path:
         raise HTTPException(
             status_code=404,
-            detail="음성 파일이 더 이상 존재하지 않습니다 (서버 재시작으로 삭제됨)",
+            detail="음성 파일이 존재하지 않습니다 (업로드 기록은 있으나 데이터 없음)",
         )
+    # 복원으로 audio_file_path가 갱신됐을 수 있으니 반영
+    db.commit()
 
-    filename = os.path.basename(transcript.audio_file_path)
-    # inline=재생, attachment=다운로드
+    filename = transcript.audio_filename or os.path.basename(path)
     disposition = "attachment" if download else "inline"
     return FileResponse(
-        transcript.audio_file_path,
+        path,
         media_type="audio/webm",
-        headers={
-            "Content-Disposition": f'{disposition}; filename="{filename}"'
-        },
+        headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
     )
 
 
-# 4. 특정 음성 파일 삭제
+# 4. 특정 음성 파일 삭제 (DB 레코드 + 디스크 캐시)
 @router.delete("/audio-files/{transcript_id}")
 def delete_audio_file(transcript_id: int, db: Session = Depends(get_db)):
     """음성 파일 삭제"""
     transcript = db.query(Transcript).filter(
         Transcript.transcript_id == transcript_id
     ).first()
-    
+
     if not transcript:
-        raise HTTPException(status_code=404, detail="Audio file not found")
-    
-    if os.path.exists(transcript.audio_file_path):
-        os.remove(transcript.audio_file_path)
-    
-    db.delete(transcript)
-    db.commit()
-    
+        raise HTTPException(status_code=404, detail="음성 기록을 찾을 수 없습니다")
+
+    if transcript.audio_file_path and os.path.exists(transcript.audio_file_path):
+        try:
+            os.remove(transcript.audio_file_path)
+        except OSError:
+            pass
+
+    try:
+        db.delete(transcript)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
+
     return {"message": "Audio file deleted"}
