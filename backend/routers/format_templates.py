@@ -1,11 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from database import get_db
-from models import FormatTemplate, Transcript, Meeting
+from models import FormatTemplate, Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client, TEXT_MODEL
+from routers.doc_content import item_sections
 from pydantic import BaseModel
 from io import BytesIO
+from datetime import timezone, timedelta
 import os
+import re
+import json
+
+KST = timezone(timedelta(hours=9))
+# {{...}} 플레이스홀더 패턴
+_PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 
 router = APIRouter(prefix="/api/format-templates", tags=["format-templates"])
 
@@ -198,6 +206,159 @@ class GenerateRequest(BaseModel):
     format_template_id: int
 
 
+def _jload(v) -> list:
+    if not v:
+        return []
+    try:
+        x = json.loads(v)
+        return x if isinstance(x, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _minutes_body(items) -> str:
+    """안건별 정리를 읽기 좋은 본문 텍스트로."""
+    parts = []
+    for it in items:
+        parts.append(f"## {it.order}. {it.agenda}")
+        for label, body in item_sections(it):
+            if isinstance(body, list):
+                parts.append(f"**{label}**")
+                parts.extend(f"- {b}" for b in body)
+            else:
+                parts.append(f"**{label}**\n{body}")
+    return "\n".join(parts)
+
+
+def _meeting_values(meeting, items, raw_text):
+    """플레이스홀더 → 실제 값 매핑. (정확 치환용)"""
+    date_str = ""
+    if meeting.created_at:
+        date_str = (
+            meeting.created_at.replace(tzinfo=timezone.utc)
+            .astimezone(KST)
+            .strftime("%Y-%m-%d %H:%M")
+        )
+
+    decisions, actions, completed, discussions, speakers = [], [], [], [], []
+    for it in items:
+        if it.decision:
+            decisions.append(it.decision)
+        actions += _jload(it.action_items)
+        completed += _jload(getattr(it, "completed_items", None))
+        discussions += _jload(getattr(it, "discussions", None))
+        speakers += _jload(getattr(it, "speaker_points", None))
+
+    def bullets(xs):
+        return "\n".join(f"- {x}" for x in xs)
+
+    body = _minutes_body(items)
+    values = {
+        "title": meeting.title or "",
+        "date": date_str,
+        "participants": meeting.participants or "",
+        "agenda": "\n".join(f"{it.order}. {it.agenda}" for it in items),
+        "content": body,
+        "body": body,
+        "minutes": body,
+        "decisions": bullets(decisions),
+        "action_items": bullets(actions),
+        "todos": bullets(actions),
+        "completed": bullets(completed),
+        "discussions": bullets(discussions),
+        "speakers": bullets(speakers),
+        "raw_text": raw_text or "",
+    }
+    # 한글 별칭 → 표준 키
+    aliases = {
+        "제목": "title", "회의제목": "title", "회의명": "title",
+        "날짜": "date", "일시": "date", "회의일시": "date",
+        "참석자": "participants", "참가자": "participants",
+        "안건": "agenda", "안건목록": "agenda",
+        "내용": "content", "회의록": "content", "본문": "content", "회의내용": "content",
+        "결정": "decisions", "결정사항": "decisions",
+        "할일": "action_items", "할일목록": "action_items", "액션아이템": "action_items",
+        "한일": "completed", "완료": "completed", "완료사항": "completed",
+        "의견": "discussions", "주요의견": "discussions",
+        "발언자": "speakers", "발언자별정리": "speakers",
+        "원본": "raw_text", "전문": "raw_text", "원본텍스트": "raw_text",
+    }
+    return values, aliases
+
+
+def _ai_fill_unknown(tokens, meeting, raw_text) -> dict:
+    """표준 키에 없는 사용자 정의 플레이스홀더를 회의 내용 기반으로 AI가 채움."""
+    listing = "\n".join(f"- {t}" for t in tokens)
+    try:
+        resp = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "회의 내용을 바탕으로 요청된 각 항목의 값을 채우는 AI입니다. "
+                        "반드시 {\"항목명\": \"값\"} 형태의 순수 JSON 객체만 응답하세요. "
+                        "회의에 없는 내용은 지어내지 말고 빈 문자열로 두세요."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"[회의 제목]\n{meeting.title}\n\n"
+                        f"[회의 내용]\n{raw_text}\n\n"
+                        f"[채울 항목들]\n{listing}\n\n"
+                        "각 항목에 들어갈 값을 JSON으로 주세요."
+                    ),
+                },
+            ],
+            temperature=0.3,
+        )
+        text = resp.choices[0].message.content.strip()
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.lstrip().lower().startswith("json"):
+                text = text.lstrip()[4:]
+            text = text.strip()
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}  # AI 실패 시 빈 값으로 (전체 실패 방지)
+
+
+def _fill_placeholders(template_text, meeting, items, raw_text) -> str:
+    """서식의 {{...}} 플레이스홀더를 실제 값으로 정확히 치환."""
+    values, aliases = _meeting_values(meeting, items, raw_text)
+    norm_alias = {k.replace(" ", ""): v for k, v in aliases.items()}
+
+    tokens = list({m.strip() for m in _PLACEHOLDER_RE.findall(template_text)})
+    resolved, unknown = {}, []
+    for tok in tokens:
+        key = tok.lower().replace(" ", "").replace("_", "")
+        if tok.lower() in values:
+            resolved[tok] = values[tok.lower()]
+        elif key in {k.replace("_", "") for k in values}:
+            # 표준 키(언더스코어 무시) 매칭
+            for vk in values:
+                if vk.replace("_", "") == key:
+                    resolved[tok] = values[vk]
+                    break
+        elif tok in aliases:
+            resolved[tok] = values[aliases[tok]]
+        elif tok.replace(" ", "") in norm_alias:
+            resolved[tok] = values[norm_alias[tok.replace(" ", "")]]
+        else:
+            unknown.append(tok)
+
+    if unknown:
+        ai_vals = _ai_fill_unknown(unknown, meeting, raw_text)
+        for tok in unknown:
+            resolved[tok] = str(ai_vals.get(tok, ""))
+
+    return _PLACEHOLDER_RE.sub(
+        lambda m: str(resolved.get(m.group(1).strip(), "")), template_text
+    )
+
+
 # 4. 회의 원본을 서식 템플릿 형식대로 AI로 생성
 @router.post("/generate")
 def generate_formatted(req: GenerateRequest, db: Session = Depends(get_db)):
@@ -227,6 +388,26 @@ def generate_formatted(req: GenerateRequest, db: Session = Depends(get_db)):
             status_code=400, detail="회의 원본 텍스트가 없습니다 (먼저 음성 처리 필요)"
         )
 
+    # 서식에 {{...}} 플레이스홀더가 있으면 → 정확히 값 채우기 모드
+    if _PLACEHOLDER_RE.search(template.content or ""):
+        items = (
+            db.query(MeetingAgendaItem)
+            .filter(MeetingAgendaItem.meeting_id == req.meeting_id)
+            .order_by(MeetingAgendaItem.order)
+            .all()
+        )
+        try:
+            filled = _fill_placeholders(template.content, meeting, items, raw_text)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"서식 채우기 실패: {e}")
+        return {
+            "meeting_id": req.meeting_id,
+            "format_template_id": req.format_template_id,
+            "formatted": filled,
+            "mode": "placeholder",
+        }
+
+    # 플레이스홀더가 없으면 → 형식 모방 모드(기존)
     try:
         response = client.chat.completions.create(
             model=TEXT_MODEL,
