@@ -186,6 +186,78 @@ async def upload_format_template(
     return _serialize(t, preview=True)
 
 
+# 2-1. 예시 서식 추가 (플레이스홀더 데모용) — 이미 있으면 건너뜀
+_EXAMPLE_TEMPLATES = {
+    "표준 회의록 (예시)": """# {{제목}}
+
+- 일시: {{날짜}}
+- 참석자: {{참석자}}
+
+## 안건
+{{안건}}
+
+## 논의 내용
+{{내용}}
+
+## 결정 사항
+{{결정}}
+
+## 할 일
+{{할일}}
+""",
+    "실무 액션 중심 (예시)": """# {{제목}} 회의 결과
+
+📅 {{날짜}}  |  👥 {{참석자}}
+
+## ✅ 한 일
+{{한일}}
+
+## 📋 할 일
+{{할일}}
+
+## 💡 결정 사항
+{{결정}}
+""",
+    "의견·발언 정리형 (예시)": """# {{제목}}
+
+일시: {{날짜}}
+참석: {{참석자}}
+
+## 주요 의견
+{{의견}}
+
+## 발언자별 정리
+{{발언자}}
+
+## 결정
+{{결정}}
+
+## 액션 아이템
+{{할일}}
+""",
+}
+
+
+@router.post("/examples")
+def add_example_templates(db: Session = Depends(get_db)):
+    """플레이스홀더가 든 예시 서식들을 추가. 같은 이름이 이미 있으면 건너뜀."""
+    existing = {t.name for t in db.query(FormatTemplate.name).all()}
+    created = 0
+    try:
+        for name, content in _EXAMPLE_TEMPLATES.items():
+            if name in existing:
+                continue
+            db.add(FormatTemplate(
+                name=name, content=content, source_filename="example"
+            ))
+            created += 1
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"예시 추가 실패: {e}")
+    return {"added": created, "total_examples": len(_EXAMPLE_TEMPLATES)}
+
+
 # 3. 서식 템플릿 삭제
 @router.delete("/{format_template_id}")
 def delete_format_template(format_template_id: int, db: Session = Depends(get_db)):
