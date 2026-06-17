@@ -3,9 +3,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
+from routers.doc_content import item_sections
 from datetime import datetime, timezone, timedelta
-import json
 import os
+import textwrap
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -17,6 +18,9 @@ router = APIRouter(prefix="/api/meetings", tags=["pdf"])
 
 PDF_DIR = "pdf"
 KST = timezone(timedelta(hours=9))
+
+# 페이지 폭을 넘지 않도록 긴 한글 줄을 적당히 끊는 기준(대략)
+WRAP_WIDTH = 38
 
 # 폰트 경로: 맥이면 시스템 폰트, 리눅스(Render)면 동봉 폰트
 _MAC_FONT = "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
@@ -69,15 +73,19 @@ def save_pdf(meeting_id: int, db: Session = Depends(get_db)):
     else:
         y -= 4 * mm
 
-    # 안건
+    # 안건 (내용·주요 의견·결정·한 일·할 일 모두 출력)
     for item in items:
         line(f"{item.order}. {item.agenda}", size=14, gap=8)
-        if item.decision:
-            line(f"  결정: {item.decision}", size=11, gap=6)
-        if item.action_items:
-            actions = json.loads(item.action_items)
-            for a in actions:
-                line(f"  - {a}", size=11, gap=6)
+        for label, body in item_sections(item):
+            if isinstance(body, list):
+                line(f"  [{label}]", size=11, gap=6)
+                for b in body:
+                    for seg in textwrap.wrap(f"- {b}", WRAP_WIDTH) or ["-"]:
+                        line(f"   {seg}", size=11, gap=6)
+            else:
+                line(f"  [{label}]", size=11, gap=6)
+                for seg in textwrap.wrap(str(body), WRAP_WIDTH) or [""]:
+                    line(f"   {seg}", size=11, gap=6)
         y -= 4 * mm
 
     c.save()
@@ -135,15 +143,19 @@ def download_pdf(meeting_id: int, db: Session = Depends(get_db)):
     else:
         y -= 4 * mm
 
-    # 안건
+    # 안건 (내용·주요 의견·결정·한 일·할 일 모두 출력)
     for item in items:
         line(f"{item.order}. {item.agenda}", size=14, gap=8)
-        if item.decision:
-            line(f"  결정: {item.decision}", size=11, gap=6)
-        if item.action_items:
-            actions = json.loads(item.action_items)
-            for a in actions:
-                line(f"  - {a}", size=11, gap=6)
+        for label, body in item_sections(item):
+            if isinstance(body, list):
+                line(f"  [{label}]", size=11, gap=6)
+                for b in body:
+                    for seg in textwrap.wrap(f"- {b}", WRAP_WIDTH) or ["-"]:
+                        line(f"   {seg}", size=11, gap=6)
+            else:
+                line(f"  [{label}]", size=11, gap=6)
+                for seg in textwrap.wrap(str(body), WRAP_WIDTH) or [""]:
+                    line(f"   {seg}", size=11, gap=6)
         y -= 4 * mm
 
     c.save()

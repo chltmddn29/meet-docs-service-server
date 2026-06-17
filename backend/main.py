@@ -15,28 +15,41 @@ Base.metadata.create_all(bind=engine)
 def _run_lightweight_migrations():
     """create_all()은 기존 테이블에 새 컬럼을 추가하지 않으므로,
     누락된 컬럼을 시작 시 안전하게 보충한다(idempotent)."""
-    # transcripts 테이블에 오디오 영속화 컬럼이 없으면 추가
     is_sqlite = engine.url.get_backend_name() == "sqlite"
     blob_type = "BLOB" if is_sqlite else "BYTEA"
-    needed = {
-        "audio_data": f"ALTER TABLE transcripts ADD COLUMN audio_data {blob_type}",
-        "audio_filename": "ALTER TABLE transcripts ADD COLUMN audio_filename VARCHAR",
+
+    # 테이블별 추가해야 할 컬럼 (없을 때만 ADD)
+    migrations = {
+        "transcripts": {
+            "audio_data": f"ALTER TABLE transcripts ADD COLUMN audio_data {blob_type}",
+            "audio_filename": "ALTER TABLE transcripts ADD COLUMN audio_filename VARCHAR",
+        },
+        "meeting_agenda_items": {
+            "discussions": "ALTER TABLE meeting_agenda_items ADD COLUMN discussions TEXT",
+            "completed_items": "ALTER TABLE meeting_agenda_items ADD COLUMN completed_items TEXT",
+        },
     }
+
     try:
         inspector = inspect(engine)
-        existing = {c["name"] for c in inspector.get_columns("transcripts")}
     except Exception as e:
         logger.warning("마이그레이션 검사 건너뜀: %s", e)
         return
 
     with engine.begin() as conn:
-        for col, ddl in needed.items():
-            if col not in existing:
-                try:
-                    conn.execute(text(ddl))
-                    logger.info("컬럼 추가: transcripts.%s", col)
-                except Exception as e:
-                    logger.warning("컬럼 추가 실패(%s): %s", col, e)
+        for table, cols in migrations.items():
+            try:
+                existing = {c["name"] for c in inspector.get_columns(table)}
+            except Exception as e:
+                logger.warning("테이블 검사 건너뜀(%s): %s", table, e)
+                continue
+            for col, ddl in cols.items():
+                if col not in existing:
+                    try:
+                        conn.execute(text(ddl))
+                        logger.info("컬럼 추가: %s.%s", table, col)
+                    except Exception as e:
+                        logger.warning("컬럼 추가 실패(%s.%s): %s", table, col, e)
 
 
 _run_lightweight_migrations()

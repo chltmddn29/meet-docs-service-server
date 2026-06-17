@@ -58,8 +58,10 @@ class MeetingAgendaItem(Base):
     agenda = Column(String)
     order = Column(Integer)
     content = Column(Text, nullable=True)
+    discussions = Column(Text, nullable=True)      # 주요 의견들 (JSON 배열)
     decision = Column(Text, nullable=True)
-    action_items = Column(Text, nullable=True)
+    completed_items = Column(Text, nullable=True)  # 한 일 (JSON 배열)
+    action_items = Column(Text, nullable=True)     # 할 일 (JSON 배열)
     participants = Column(Text, nullable=True)
     
     meeting = relationship("Meeting", back_populates="agenda_items")

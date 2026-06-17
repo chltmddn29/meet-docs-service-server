@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
-import json
+from routers.doc_content import build_markdown
 
 router = APIRouter(prefix="/api/meetings", tags=["preview"])
 
@@ -18,18 +18,8 @@ def preview_meeting(meeting_id: int, db: Session = Depends(get_db)):
         MeetingAgendaItem.meeting_id == meeting_id
     ).order_by(MeetingAgendaItem.order).all()
 
-    # 마크다운 텍스트 생성 (미리보기용)
-    md = f"# {meeting.title}\n\n"
-    md += f"> {meeting.created_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-    for item in items:
-        md += f"## {item.order}. {item.agenda}\n\n"
-        if item.decision:
-            md += f"**결정:** {item.decision}\n\n"
-        if item.action_items:
-            actions = json.loads(item.action_items)
-            for a in actions:
-                md += f"- [ ] {a}\n"
-            md += "\n"
+    # 모든 필드를 포함한 마크다운 (공용 빌더)
+    md = build_markdown(meeting, items)
 
     # 저장된 플랫폼 목록
     saves = db.query(PlatformSave).filter(

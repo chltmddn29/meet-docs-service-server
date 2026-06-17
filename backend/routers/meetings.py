@@ -98,7 +98,9 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
                 "agenda": i.agenda,
                 "order": i.order,
                 "content": i.content,
+                "discussions": json.loads(i.discussions) if i.discussions else [],
                 "decision": i.decision,
+                "completed_items": json.loads(i.completed_items) if i.completed_items else [],
                 "action_items": json.loads(i.action_items) if i.action_items else [],
             }
             for i in items

@@ -68,17 +68,26 @@ def extract_json_array(text: str) -> list:
     for item in parsed:
         if not isinstance(item, dict):
             continue
-        actions = item.get("action_items", [])
-        if not isinstance(actions, list):
-            actions = [str(actions)] if actions else []
         normalized.append({
             "agenda": str(item.get("agenda", "")).strip(),
             "content": str(item.get("content", "")).strip(),
+            "discussions": _as_str_list(item.get("discussions")),
             "decision": str(item.get("decision", "")).strip(),
-            "action_items": [str(a).strip() for a in actions if str(a).strip()],
+            "completed_items": _as_str_list(item.get("completed_items")),
+            "action_items": _as_str_list(item.get("action_items")),
         })
 
     return normalized
+
+
+def _as_str_list(value) -> list:
+    """리스트/문자열/None을 깔끔한 문자열 리스트로 정규화."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v).strip()]
+    s = str(value).strip()
+    return [s] if s else []
 
 
 def _try_load(s: str):

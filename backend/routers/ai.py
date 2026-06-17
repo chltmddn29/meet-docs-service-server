@@ -12,22 +12,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/meetings", tags=["ai"])
 
 _SYSTEM_PROMPT = (
-    "당신은 회의록을 분석하는 AI입니다. 반드시 순수 JSON 배열만 응답하세요. "
-    "마크다운 코드블록이나 다른 텍스트는 절대 포함하지 마세요."
+    "당신은 회의록을 꼼꼼하게 정리하는 전문 서기입니다. "
+    "내용을 과도하게 압축하지 말고, 실제로 오간 논의·의견·할 일을 충실히 담으세요. "
+    "반드시 순수 JSON 배열만 응답하세요. 마크다운 코드블록이나 다른 텍스트는 절대 포함하지 마세요."
 )
 
 
 def _build_user_prompt(raw_text: str) -> str:
     return f"""
-다음 회의록 텍스트를 분석해서 JSON 배열 형식으로 반환해주세요.
+다음 회의록 텍스트를 안건별로 분석해서 JSON 배열로 반환하세요.
 
 각 항목의 형식:
 {{
   "agenda": "안건명",
-  "content": "논의된 내용",
-  "decision": "결정사항",
-  "action_items": ["할 일 1", "할 일 2"]
+  "content": "이 안건에서 논의된 내용을 구체적이고 충실하게 (2~5문장, 요약만 하지 말 것)",
+  "discussions": ["참석자들이 낸 주요 의견·관점·근거를 하나씩", "..."],
+  "decision": "확정된 결정사항 (없으면 빈 문자열)",
+  "completed_items": ["이미 완료했다고 언급된 일(한 일)", "..."],
+  "action_items": ["앞으로 해야 할 일(할 일)", "..."]
 }}
+
+작성 규칙:
+- content는 핵심만 압축하지 말고 맥락이 드러나게 구체적으로 적으세요.
+- discussions에는 찬반·대안·우려 등 회의에서 실제 나온 의견을 빠짐없이 담으세요.
+- completed_items(한 일)와 action_items(할 일)를 명확히 구분하세요.
+  이미 끝난 일은 completed_items, 앞으로 할 일은 action_items 입니다.
+- 회의에 없던 내용을 지어내지 말고, 해당 항목이 없으면 빈 배열/빈 문자열로 두세요.
 
 회의록 텍스트:
 {raw_text}
@@ -81,7 +91,13 @@ def analyze_and_save(meeting_id: int, raw_text: str, db: Session) -> list:
                 agenda=item.get("agenda", ""),
                 order=idx + 1,
                 content=item.get("content", ""),
+                discussions=json.dumps(
+                    item.get("discussions", []), ensure_ascii=False
+                ),
                 decision=item.get("decision", ""),
+                completed_items=json.dumps(
+                    item.get("completed_items", []), ensure_ascii=False
+                ),
                 action_items=json.dumps(
                     item.get("action_items", []), ensure_ascii=False
                 ),

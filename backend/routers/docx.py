@@ -3,8 +3,8 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem, PlatformSave
+from routers.doc_content import item_sections
 from datetime import datetime, timezone, timedelta
-import json
 import os
 
 from docx import Document
@@ -47,21 +47,19 @@ def save_docx(meeting_id: int, db: Session = Depends(get_db)):
         p.add_run("👥 참석자: ").bold = True
         p.add_run(meeting.participants)
 
-    # 안건
+    # 안건 (내용·주요 의견·결정·한 일·할 일 모두 출력)
     for item in items:
         doc.add_heading(f"{item.order}. {item.agenda}", level=1)
-
-        if item.decision:
-            p = doc.add_paragraph()
-            p.add_run("결정: ").bold = True
-            p.add_run(item.decision)
-
-        if item.action_items:
-            actions = json.loads(item.action_items)
-            if actions:
-                doc.add_paragraph("할 일:").bold = True
-                for a in actions:
-                    doc.add_paragraph(a, style="List Bullet")
+        for label, body in item_sections(item):
+            if isinstance(body, list):
+                p = doc.add_paragraph()
+                p.add_run(f"{label}:").bold = True
+                for b in body:
+                    doc.add_paragraph(b, style="List Bullet")
+            else:
+                p = doc.add_paragraph()
+                p.add_run(f"{label}: ").bold = True
+                p.add_run(str(body))
 
     doc.save(file_path)
 
@@ -108,21 +106,19 @@ def download_docx(meeting_id: int, db: Session = Depends(get_db)):
         p.add_run("👥 참석자: ").bold = True
         p.add_run(meeting.participants)
 
-    # 안건
+    # 안건 (내용·주요 의견·결정·한 일·할 일 모두 출력)
     for item in items:
         doc.add_heading(f"{item.order}. {item.agenda}", level=1)
-
-        if item.decision:
-            p = doc.add_paragraph()
-            p.add_run("결정: ").bold = True
-            p.add_run(item.decision)
-
-        if item.action_items:
-            actions = json.loads(item.action_items)
-            if actions:
-                doc.add_paragraph("할 일:").bold = True
-                for a in actions:
-                    doc.add_paragraph(a, style="List Bullet")
+        for label, body in item_sections(item):
+            if isinstance(body, list):
+                p = doc.add_paragraph()
+                p.add_run(f"{label}:").bold = True
+                for b in body:
+                    doc.add_paragraph(b, style="List Bullet")
+            else:
+                p = doc.add_paragraph()
+                p.add_run(f"{label}: ").bold = True
+                p.add_run(str(body))
 
     doc.save(file_path)
 
