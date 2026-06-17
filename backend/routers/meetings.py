@@ -66,6 +66,48 @@ def get_meetings(db: Session = Depends(get_db)):
     return db.query(Meeting).all()
 
 
+# 2-1. 회의 삭제 (연관 데이터 모두 정리)
+@router.delete("/{meeting_id}")
+def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
+    """회의와 연관 데이터(안건·음성·저장파일)를 모두 삭제"""
+    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+    if not meeting:
+        raise HTTPException(status_code=404, detail="회의를 찾을 수 없습니다")
+
+    # 디스크 파일 정리 (음성 + 저장된 문서)
+    transcripts = db.query(Transcript).filter(
+        Transcript.meeting_id == meeting_id
+    ).all()
+    saves = db.query(PlatformSave).filter(
+        PlatformSave.meeting_id == meeting_id
+    ).all()
+    for f in [t.audio_file_path for t in transcripts] + [s.platform_doc_id for s in saves]:
+        try:
+            if f and os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass  # 파일 삭제 실패는 무시 (DB는 정리)
+
+    # DB 레코드 정리
+    try:
+        db.query(MeetingAgendaItem).filter(
+            MeetingAgendaItem.meeting_id == meeting_id
+        ).delete()
+        db.query(Transcript).filter(
+            Transcript.meeting_id == meeting_id
+        ).delete()
+        db.query(PlatformSave).filter(
+            PlatformSave.meeting_id == meeting_id
+        ).delete()
+        db.delete(meeting)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
+
+    return {"meeting_id": meeting_id, "status": "deleted"}
+
+
 # 3. 특정 회의 상세 조회 (안건 + 참석자 + 원본 텍스트 포함)
 @router.get("/{meeting_id}")
 def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
