@@ -10,8 +10,98 @@ import os
 router = APIRouter(prefix="/api/format-templates", tags=["format-templates"])
 
 
+def _extract_hwpx(data: bytes) -> str:
+    """HWPX(최신 한글, ZIP+XML)에서 본문 텍스트 추출. 표준 라이브러리만 사용."""
+    import zipfile
+    import re
+    import html
+
+    parts = []
+    with zipfile.ZipFile(BytesIO(data)) as z:
+        # 본문은 Contents/section0.xml, section1.xml ...
+        names = sorted(
+            n for n in z.namelist()
+            if n.lower().startswith("contents/") and n.lower().endswith(".xml")
+        )
+        for n in names:
+            xml = z.read(n).decode("utf-8", errors="ignore")
+            # 텍스트는 <hp:t> ... </hp:t> 안에 들어있음
+            for m in re.findall(r"<hp:t[^>]*>(.*?)</hp:t>", xml, re.DOTALL):
+                clean = re.sub(r"<[^>]+>", "", m)        # 내부 태그 제거
+                parts.append(html.unescape(clean))
+    return "\n".join(p for p in parts if p.strip())
+
+
+def _extract_hwp(data: bytes) -> str:
+    """HWP5(구형 한글, OLE 바이너리)에서 본문 텍스트 추출. olefile 필요."""
+    import zlib
+    import struct
+    try:
+        import olefile
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="HWP 처리 모듈이 준비되지 않았어요 (서버에 olefile 설치 필요).",
+        )
+
+    try:
+        ole = olefile.OleFileIO(BytesIO(data))
+    except Exception:
+        raise HTTPException(status_code=400, detail="HWP 파일을 열 수 없습니다 (손상되었거나 형식 오류).")
+
+    try:
+        dirs = ole.listdir()
+        if ["FileHeader"] not in dirs:
+            raise HTTPException(status_code=400, detail="올바른 HWP 파일이 아닙니다.")
+
+        header = ole.openstream("FileHeader").read()
+        is_compressed = bool(header[36] & 1)
+
+        # BodyText/Section0, Section1 ... 수집
+        section_nums = sorted(
+            int(d[1][len("Section"):])
+            for d in dirs
+            if len(d) > 1 and d[0] == "BodyText" and d[1].startswith("Section")
+        )
+
+        out = []
+        for num in section_nums:
+            stream = ole.openstream(f"BodyText/Section{num}").read()
+            if is_compressed:
+                stream = zlib.decompress(stream, -15)
+            out.append(_parse_hwp_section(stream, struct))
+        return "\n".join(out)
+    finally:
+        ole.close()
+
+
+def _parse_hwp_section(buf: bytes, struct) -> str:
+    """HWP 섹션 레코드를 순회하며 문단 텍스트(PARA_TEXT, tag=67)만 추출."""
+    HWPTAG_PARA_TEXT = 67
+    parts = []
+    i, size = 0, len(buf)
+    while i + 4 <= size:
+        header = struct.unpack_from("<I", buf, i)[0]
+        rec_type = header & 0x3FF
+        rec_len = (header >> 20) & 0xFFF
+        data_start = i + 4
+        # size가 0xFFF면 다음 4바이트가 실제 길이
+        if rec_len == 0xFFF:
+            rec_len = struct.unpack_from("<I", buf, i + 4)[0]
+            data_start = i + 8
+        if rec_type == HWPTAG_PARA_TEXT:
+            raw = buf[data_start:data_start + rec_len]
+            s = raw.decode("utf-16-le", errors="ignore")
+            # 인라인 제어문자 제거(개행·탭은 유지)
+            s = "".join(c for c in s if c in "\n\t" or ord(c) >= 32)
+            if s.strip():
+                parts.append(s)
+        i = data_start + rec_len
+    return "\n".join(parts)
+
+
 def _extract_text(filename: str, data: bytes) -> str:
-    """업로드 파일에서 본문 텍스트 추출 (docx/md/txt 지원)"""
+    """업로드 파일에서 본문 텍스트 추출 (docx/hwp/hwpx/md/txt 지원)"""
     ext = os.path.splitext(filename)[1].lower()
     if ext in (".txt", ".md"):
         return data.decode("utf-8", errors="ignore")
@@ -24,9 +114,13 @@ def _extract_text(filename: str, data: bytes) -> str:
             for row in table.rows:
                 parts.append(" | ".join(c.text for c in row.cells))
         return "\n".join(parts)
+    if ext == ".hwpx":
+        return _extract_hwpx(data)
+    if ext == ".hwp":
+        return _extract_hwp(data)
     raise HTTPException(
         status_code=400,
-        detail=f"지원하지 않는 형식입니다: {ext or '확장자 없음'} (docx/md/txt만 가능)",
+        detail=f"지원하지 않는 형식입니다: {ext or '확장자 없음'} (docx/hwp/hwpx/md/txt 가능)",
     )
 
 
@@ -58,16 +152,29 @@ async def upload_format_template(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    data = await file.read()
+    try:
+        data = await file.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
+    if not data:
+        raise HTTPException(status_code=400, detail="빈 파일입니다")
+
     text = _extract_text(file.filename or "", data)
     if not text.strip():
-        raise HTTPException(status_code=400, detail="파일에서 텍스트를 추출하지 못했습니다")
+        raise HTTPException(
+            status_code=400,
+            detail="파일에서 텍스트를 추출하지 못했습니다 (빈 문서이거나 형식 문제).",
+        )
 
     name = os.path.splitext(file.filename or "서식")[0]
     t = FormatTemplate(name=name, content=text, source_filename=file.filename)
-    db.add(t)
-    db.commit()
-    db.refresh(t)
+    try:
+        db.add(t)
+        db.commit()
+        db.refresh(t)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"서식 저장 실패: {e}")
     return _serialize(t, preview=True)
 
 
