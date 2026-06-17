@@ -1,5 +1,5 @@
 """할 일 모아보기 — 모든 회의의 할 일(action_items)·한 일(completed_items)을 집계."""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Meeting, MeetingAgendaItem
@@ -25,7 +25,11 @@ def _load_list(value) -> list:
 def get_todos(db: Session = Depends(get_db)):
     """회의별로 할 일/한 일을 묶어 최신순으로 반환.
     할 일 또는 한 일이 하나라도 있는 회의만 포함."""
-    meetings = db.query(Meeting).order_by(Meeting.created_at.desc()).all()
+    try:
+        meetings = db.query(Meeting).order_by(Meeting.created_at.desc()).all()
+    except Exception as e:
+        logger.exception("할 일 조회 실패")
+        raise HTTPException(status_code=500, detail=f"할 일을 불러오지 못했어요: {e}")
 
     result = []
     total_pending = 0

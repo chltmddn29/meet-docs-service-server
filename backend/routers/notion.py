@@ -12,14 +12,32 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 router = APIRouter(prefix="/api/meetings", tags=["notion"])
 
-notion = Client(auth=os.getenv("NOTION_TOKEN"))
+_NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
+notion = Client(auth=_NOTION_TOKEN) if _NOTION_TOKEN else None
 KST = timezone(timedelta(hours=9))  # 한국 시간
+
+
+def _safe_actions(raw) -> list:
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 @router.post("/{meeting_id}/save-notion")
 def save_notion(meeting_id: int, db: Session = Depends(get_db)):
     """회의록을 노션 페이지로 저장"""
+    # 노션 연동 설정 확인 → 미설정이면 명확히 안내
+    if notion is None or not PARENT_PAGE_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="노션 연동이 설정되지 않았어요 (NOTION_TOKEN / NOTION_PARENT_PAGE_ID 필요).",
+        )
+
     meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
@@ -75,8 +93,8 @@ def save_notion(meeting_id: int, db: Session = Depends(get_db)):
                 },
             })
         # 할 일 (체크박스)
-        if item.action_items:
-            actions = json.loads(item.action_items)
+        actions = _safe_actions(item.action_items)
+        if actions:
             for a in actions:
                 children.append({
                     "object": "block",

@@ -48,9 +48,10 @@ def item_sections(item):
 
 
 def build_markdown(meeting, items) -> str:
-    created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
-    md = f"# {meeting.title}\n\n"
-    md += f"> 📅 {created.strftime('%Y-%m-%d %H:%M')}\n>\n"
+    md = f"# {meeting.title or '제목 없음'}\n\n"
+    if meeting.created_at:
+        created = meeting.created_at.replace(tzinfo=timezone.utc).astimezone(KST)
+        md += f"> 📅 {created.strftime('%Y-%m-%d %H:%M')}\n>\n"
     if meeting.participants:
         md += f"> 👥 참석자: {meeting.participants}\n"
     md += "\n---\n\n"

@@ -22,13 +22,23 @@ class TemplateUpdate(BaseModel):
     participants: list[str] = None
 
 
+def _safe_list(raw) -> list:
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _serialize(t: Template) -> dict:
     """Template ORM 객체를 JSON 응답용 dict로 변환"""
     return {
         "template_id": t.template_id,
         "name": t.name,
         "description": t.description,
-        "agenda_items": json.loads(t.agenda_items) if t.agenda_items else [],
+        "agenda_items": _safe_list(t.agenda_items),
         "participants": t.participants,
         "created_at": t.created_at.isoformat() if t.created_at else None,
     }
@@ -56,16 +66,23 @@ def get_template(template_id: int, db: Session = Depends(get_db)):
 @router.post("")
 def create_template(template: TemplateCreate, db: Session = Depends(get_db)):
     """새 템플릿 생성"""
+    if not template.name or not template.name.strip():
+        raise HTTPException(status_code=400, detail="템플릿 이름을 입력해주세요")
+
     agendas = [a.strip() for a in template.agenda_items if a.strip()]
     db_template = Template(
-        name=template.name,
+        name=template.name.strip(),
         description=template.description,
         agenda_items=json.dumps(agendas, ensure_ascii=False),
         participants=", ".join(template.participants) if template.participants else None,
     )
-    db.add(db_template)
-    db.commit()
-    db.refresh(db_template)
+    try:
+        db.add(db_template)
+        db.commit()
+        db.refresh(db_template)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"템플릿 저장 실패: {e}")
     return _serialize(db_template)
 
 
@@ -87,8 +104,12 @@ def update_template(template_id: int, template: TemplateUpdate, db: Session = De
     if template.participants is not None:
         t.participants = ", ".join(template.participants) if template.participants else None
 
-    db.commit()
-    db.refresh(t)
+    try:
+        db.commit()
+        db.refresh(t)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"템플릿 수정 실패: {e}")
     return _serialize(t)
 
 
@@ -99,6 +120,10 @@ def delete_template(template_id: int, db: Session = Depends(get_db)):
     t = db.query(Template).filter(Template.template_id == template_id).first()
     if not t:
         raise HTTPException(status_code=404, detail="Template not found")
-    db.delete(t)
-    db.commit()
+    try:
+        db.delete(t)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"템플릿 삭제 실패: {e}")
     return {"message": "Template deleted"}
