@@ -27,6 +27,7 @@ def _run_lightweight_migrations():
         "meeting_agenda_items": {
             "discussions": "ALTER TABLE meeting_agenda_items ADD COLUMN discussions TEXT",
             "completed_items": "ALTER TABLE meeting_agenda_items ADD COLUMN completed_items TEXT",
+            "speaker_points": "ALTER TABLE meeting_agenda_items ADD COLUMN speaker_points TEXT",
         },
     }
 

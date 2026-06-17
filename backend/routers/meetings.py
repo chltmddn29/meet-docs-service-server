@@ -99,6 +99,7 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
                 "order": i.order,
                 "content": i.content,
                 "discussions": json.loads(i.discussions) if i.discussions else [],
+                "speaker_points": json.loads(i.speaker_points) if i.speaker_points else [],
                 "decision": i.decision,
                 "completed_items": json.loads(i.completed_items) if i.completed_items else [],
                 "action_items": json.loads(i.action_items) if i.action_items else [],

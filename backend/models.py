@@ -59,6 +59,7 @@ class MeetingAgendaItem(Base):
     order = Column(Integer)
     content = Column(Text, nullable=True)
     discussions = Column(Text, nullable=True)      # 주요 의견들 (JSON 배열)
+    speaker_points = Column(Text, nullable=True)   # 발언자별 정리 (JSON 배열, "이름: 내용")
     decision = Column(Text, nullable=True)
     completed_items = Column(Text, nullable=True)  # 한 일 (JSON 배열)
     action_items = Column(Text, nullable=True)     # 할 일 (JSON 배열)

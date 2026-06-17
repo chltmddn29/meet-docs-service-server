@@ -72,6 +72,7 @@ def extract_json_array(text: str) -> list:
             "agenda": str(item.get("agenda", "")).strip(),
             "content": str(item.get("content", "")).strip(),
             "discussions": _as_str_list(item.get("discussions")),
+            "speaker_points": _as_speaker_list(item.get("speaker_points")),
             "decision": str(item.get("decision", "")).strip(),
             "completed_items": _as_str_list(item.get("completed_items")),
             "action_items": _as_str_list(item.get("action_items")),
@@ -88,6 +89,30 @@ def _as_str_list(value) -> list:
         return [str(v).strip() for v in value if str(v).strip()]
     s = str(value).strip()
     return [s] if s else []
+
+
+def _as_speaker_list(value) -> list:
+    """발언자별 정리를 "이름: 내용" 문자열 리스트로 정규화.
+    LLM이 ["김대리: ..."] 또는 [{"speaker":"김대리","point":"..."}] 어느 쪽으로
+    줘도 동일한 형태로 맞춘다."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        value = [value]
+    out = []
+    for v in value:
+        if isinstance(v, dict):
+            name = str(v.get("speaker") or v.get("name") or "").strip()
+            point = str(v.get("point") or v.get("content") or "").strip()
+            if name and point:
+                out.append(f"{name}: {point}")
+            elif point:
+                out.append(point)
+        else:
+            s = str(v).strip()
+            if s:
+                out.append(s)
+    return out
 
 
 def _try_load(s: str):

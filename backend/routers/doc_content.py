@@ -33,6 +33,9 @@ def item_sections(item):
     discussions = _load_list(getattr(item, "discussions", None))
     if discussions:
         sections.append(("주요 의견", discussions))
+    speakers = _load_list(getattr(item, "speaker_points", None))
+    if speakers:
+        sections.append(("발언자별 정리", speakers))
     if item.decision:
         sections.append(("결정사항", item.decision))
     completed = _load_list(getattr(item, "completed_items", None))
