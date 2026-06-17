@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from database import Base, engine
 from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, Template, FormatTemplate
-from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos
+from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos, hwpx
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ app.include_router(preview.router)
 app.include_router(templates.router)
 app.include_router(format_templates.router)
 app.include_router(todos.router)
+app.include_router(hwpx.router)
 
 # CORS 설정
 # allow_origins=["*"] 와 allow_credentials=True 는 함께 쓸 수 없음(브라우저가 거부).
