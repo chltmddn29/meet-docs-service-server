@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript, Meeting, MeetingAgendaItem
-from routers.groq_client import client, ensure_client
+from routers.groq_client import client, ensure_client, TEXT_MODEL
 from routers.audio_store import ensure_local_file
 import os
 import logging
@@ -52,7 +52,7 @@ def correct_transcription(text: str, meeting_title: str = "", agenda_list: str =
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=TEXT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"다음 텍스트를 보정해주세요:\n{text}"},

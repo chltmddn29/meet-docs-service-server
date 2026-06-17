@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.orm import Session
 from database import get_db
 from models import FormatTemplate, Transcript, Meeting
-from routers.groq_client import client
+from routers.groq_client import client, TEXT_MODEL
 from pydantic import BaseModel
 from io import BytesIO
 import os
@@ -122,7 +122,7 @@ def generate_formatted(req: GenerateRequest, db: Session = Depends(get_db)):
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=TEXT_MODEL,
             messages=[
                 {
                     "role": "system",

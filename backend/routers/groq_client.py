@@ -18,6 +18,11 @@ if not _api_key:
 
 client = Groq(api_key=_api_key) if _api_key else None
 
+# 회의 보정·분석에 쓰는 텍스트 모델.
+# Groq 무료 호스팅 중 가장 크고 강력한 모델(OpenAI 오픈 웨이트 120B).
+# 모델 교체는 이 한 줄만 바꾸면 됨.
+TEXT_MODEL = "openai/gpt-oss-120b"
+
 
 def ensure_client():
     """Groq client가 준비됐는지 확인. 없으면 503으로 명확히 알린다."""

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript, MeetingAgendaItem
-from routers.groq_client import client, ensure_client
+from routers.groq_client import client, ensure_client, TEXT_MODEL
 from routers.llm_utils import extract_json_array
 import json
 import logging
@@ -54,7 +54,7 @@ def analyze_and_save(meeting_id: int, raw_text: str, db: Session) -> list:
     # 1) LLM 호출
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=TEXT_MODEL,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": _build_user_prompt(raw_text)},
