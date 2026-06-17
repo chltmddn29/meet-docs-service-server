@@ -145,6 +145,7 @@ def get_meeting(meeting_id: int, db: Session = Depends(get_db)):
                 "decision": i.decision,
                 "completed_items": json.loads(i.completed_items) if i.completed_items else [],
                 "action_items": json.loads(i.action_items) if i.action_items else [],
+                "action_checked": json.loads(i.action_checked) if i.action_checked else [],
             }
             for i in items
         ],

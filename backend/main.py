@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import inspect, text
 from database import Base, engine
 from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, Template, FormatTemplate
-from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos, hwpx
+from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos, hwpx, action_items
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ def _run_lightweight_migrations():
             "discussions": "ALTER TABLE meeting_agenda_items ADD COLUMN discussions TEXT",
             "completed_items": "ALTER TABLE meeting_agenda_items ADD COLUMN completed_items TEXT",
             "speaker_points": "ALTER TABLE meeting_agenda_items ADD COLUMN speaker_points TEXT",
+            "action_checked": "ALTER TABLE meeting_agenda_items ADD COLUMN action_checked TEXT",
         },
     }
 
@@ -70,6 +71,7 @@ app.include_router(templates.router)
 app.include_router(format_templates.router)
 app.include_router(todos.router)
 app.include_router(hwpx.router)
+app.include_router(action_items.router)
 
 # CORS 설정
 # allow_origins=["*"] 와 allow_credentials=True 는 함께 쓸 수 없음(브라우저가 거부).

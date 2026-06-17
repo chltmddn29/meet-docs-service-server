@@ -21,6 +21,17 @@ def _load_list(value) -> list:
         return []
 
 
+def _load_checked(value) -> list:
+    """체크 상태(bool 배열) — 문자열화하지 않고 bool로 보존."""
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+        return [bool(v) for v in parsed] if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 @router.get("")
 def get_todos(db: Session = Depends(get_db)):
     """회의별로 할 일/한 일을 묶어 최신순으로 반환.
@@ -39,11 +50,19 @@ def get_todos(db: Session = Depends(get_db)):
             MeetingAgendaItem.meeting_id == m.meeting_id
         ).order_by(MeetingAgendaItem.order).all()
 
-        pending = []   # 할 일
+        pending = []   # 할 일 (체크 가능)
         done = []      # 한 일
         for it in items:
-            for a in _load_list(it.action_items):
-                pending.append({"agenda": it.agenda, "text": a})
+            actions = _load_list(it.action_items)
+            checked = _load_checked(getattr(it, "action_checked", None))
+            for idx, a in enumerate(actions):
+                pending.append({
+                    "item_id": it.item_id,
+                    "index": idx,
+                    "agenda": it.agenda,
+                    "text": a,
+                    "checked": checked[idx] if idx < len(checked) else False,
+                })
             for c in _load_list(getattr(it, "completed_items", None)):
                 done.append({"agenda": it.agenda, "text": c})
 
