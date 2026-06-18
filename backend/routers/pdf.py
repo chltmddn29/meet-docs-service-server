@@ -22,10 +22,17 @@ KST = timezone(timedelta(hours=9))
 # 페이지 폭을 넘지 않도록 긴 한글 줄을 적당히 끊는 기준(대략)
 WRAP_WIDTH = 38
 
-# 폰트 경로: 맥이면 시스템 폰트, 리눅스(Render)면 동봉 폰트
-_MAC_FONT = "/System/Library/Fonts/Supplemental/AppleGothic.ttf"
-_BUNDLED_FONT = os.path.join(os.path.dirname(__file__), '..', 'fonts', 'NanumGothic.ttf')
-FONT_PATH = _MAC_FONT if os.path.exists(_MAC_FONT) else _BUNDLED_FONT
+# 폰트 경로 후보: 맥(AppleGothic) → 동봉 폰트 → 리눅스 시스템 나눔(도커 설치)
+_FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+    os.path.join(os.path.dirname(__file__), '..', 'fonts', 'NanumGothic.ttf'),
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+]
+FONT_PATH = next(
+    (p for p in _FONT_CANDIDATES if os.path.exists(p)),
+    _FONT_CANDIDATES[-1],
+)
 
 # 한글 폰트 등록 (한 번만)
 pdfmetrics.registerFont(TTFont("Korean", FONT_PATH))
