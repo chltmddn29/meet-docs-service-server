@@ -1,0 +1,12 @@
+**/__pycache__/
+**/*.pyc
+backend/meetdocs.db
+backend/audio/*
+backend/markdown/*
+backend/pdf/*
+backend/docx/*
+backend/hwpx/*
+backend/.env
+.git
+.DS_Store
+**/.DS_Store

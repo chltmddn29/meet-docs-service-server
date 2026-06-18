@@ -84,6 +84,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "MeetDocs API"}
+
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "message": "MeetDocs backend is running"}
@@ -91,6 +96,7 @@ def health_check():
 if __name__ == "__main__":
     import uvicorn
     import os
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # HF Spaces는 기본 7860, Render 등은 PORT 환경변수를 줌
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
