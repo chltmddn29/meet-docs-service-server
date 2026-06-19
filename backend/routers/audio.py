@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
-# 파일 업로드 크기 제한 (50MB)
-MAX_AUDIO_BYTES = 50 * 1024 * 1024
+# 파일 업로드 크기 제한 (1GB)
+MAX_AUDIO_BYTES = 1024 * 1024 * 1024
 
 
 class AudioResponse(BaseModel):
@@ -43,7 +43,7 @@ async def upload_audio(
     if len(data) > MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"파일이 너무 큽니다 ({len(data)//(1024*1024)}MB, 최대 50MB)",
+            detail=f"파일이 너무 큽니다 ({len(data)//(1024*1024*1024)}GB, 최대 1GB)",
         )
 
     try:

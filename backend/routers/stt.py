@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/meetings", tags=["stt"])
 
-# 파일 변환 크기 제한 (50MB)
-MAX_AUDIO_BYTES = 50 * 1024 * 1024
+# 파일 변환 크기 제한 (1GB)
+MAX_AUDIO_BYTES = 1024 * 1024 * 1024
 
 
 def correct_transcription(text: str, meeting_title: str = "", agenda_list: str = "",
@@ -102,7 +102,7 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
     if size > MAX_AUDIO_BYTES:
         raise HTTPException(
             status_code=413,
-            detail=f"음성 파일이 너무 큽니다 ({size // (1024*1024)}MB, 최대 50MB)",
+            detail=f"음성 파일이 너무 큽니다 ({size // (1024*1024*1024)}GB, 최대 1GB)",
         )
 
     # 회의 맥락(제목·안건·참석자)을 프롬프트로 주입 → 용어·이름 인식 정확도↑
