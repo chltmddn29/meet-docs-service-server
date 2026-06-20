@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from database import get_db
+from database import get_db, SessionLocal
 from models import Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client, ensure_client, TEXT_MODEL
 from routers.audio_store import ensure_local_file
@@ -19,8 +19,8 @@ router = APIRouter(prefix="/api/meetings", tags=["stt"])
 GROQ_FILE_LIMIT = 25 * 1024 * 1024
 # 안전 여유를 두고 24MB를 넘으면 분할 변환 경로로.
 CHUNK_THRESHOLD = 24 * 1024 * 1024
-# 분할 시 한 조각의 길이(초). opus 16kHz mono ~24kbps 기준 15분 ≈ 2~3MB로 한도에 여유.
-CHUNK_SECONDS = 900
+# 분할 시 한 조각의 길이(초). 10분이면 조각당 ~2MB로 작아 변환이 빠르고 타임아웃 안전.
+CHUNK_SECONDS = 600
 
 
 def _transcribe_one(path: str, whisper_prompt: str) -> str:
@@ -131,8 +131,15 @@ def correct_transcription(text: str, meeting_title: str = "", agenda_list: str =
 
 
 @router.post("/{meeting_id}/process")
-def process_audio(meeting_id: int, db: Session = Depends(get_db)):
-    """음성 파일을 텍스트로 변환 (Groq Whisper + AI 보정)"""
+def process_audio(
+    meeting_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """변환을 백그라운드로 시작하고 즉시 응답한다.
+    긴 회의(여러 청크)는 시간이 오래 걸려 동기 응답 시 프론트/게이트웨이가 타임아웃되므로,
+    여기서는 'processing'만 돌려주고 실제 변환은 _run_transcription에서 수행한다.
+    프론트는 GET /process-status 로 완료를 폴링한다."""
     ensure_client()  # GROQ_API_KEY 없으면 503
 
     transcript = db.query(Transcript).filter(
@@ -142,6 +149,14 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
     if not transcript:
         raise HTTPException(status_code=404, detail="음성 파일이 없습니다")
 
+    # 이미 변환이 끝나 있으면 다시 돌리지 않고 결과를 그대로 반환
+    if transcript.process_status == "completed" and transcript.raw_text:
+        return {"meeting_id": meeting_id, "status": "completed",
+                "raw_text": transcript.raw_text}
+    # 이미 진행 중이면 중복 실행 방지
+    if transcript.process_status == "processing":
+        return {"meeting_id": meeting_id, "status": "processing"}
+
     # 디스크에 없으면 DB 바이트로 복원 (재시작 후에도 처리 가능)
     audio_path = ensure_local_file(transcript)
     if not audio_path:
@@ -149,76 +164,128 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
             status_code=404,
             detail="음성 파일이 존재하지 않습니다 (데이터가 저장되지 않았습니다)",
         )
-    db.commit()  # 복원으로 audio_file_path가 갱신됐으면 반영
 
-    # 파일 크기 검증 (빈 파일·과대 파일 사전 차단)
     try:
         size = os.path.getsize(audio_path)
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"파일 접근 실패: {e}")
-
     if size == 0:
         raise HTTPException(status_code=400, detail="음성 파일이 비어있습니다 (0 bytes)")
 
-    # 회의 맥락(제목·안건·참석자)을 프롬프트로 주입 → 용어·이름 인식 정확도↑
-    meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
-    agenda_items = db.query(MeetingAgendaItem).filter(
-        MeetingAgendaItem.meeting_id == meeting_id
-    ).order_by(MeetingAgendaItem.order).all()
+    # 상태를 processing 으로 표시하고 백그라운드 작업 예약
+    transcript.process_status = "processing"
+    transcript.process_error = None
+    db.commit()
 
-    prompt_parts = ["한국어로 진행된 회의 녹음입니다."]
-    if meeting and meeting.title:
-        prompt_parts.append(f"회의 제목: {meeting.title}.")
-    agenda_text = ", ".join(a.agenda for a in agenda_items if a.agenda)
-    if agenda_text:
-        prompt_parts.append(f"주요 안건: {agenda_text}.")
-    if meeting and meeting.participants:
-        prompt_parts.append(f"참석자: {meeting.participants}.")
-    whisper_prompt = " ".join(prompt_parts)
+    background_tasks.add_task(_run_transcription, meeting_id, transcript.transcript_id)
+    return {"meeting_id": meeting_id, "status": "processing"}
 
-    # 1) Whisper STT — 25MB 이하는 바로, 초과는 ffmpeg로 잘라 순차 변환
-    try:
-        if size > CHUNK_THRESHOLD:
-            logger.info("큰 파일(%dMB) → 분할 변환", size // (1024 * 1024))
-            raw_text = _transcribe_large(audio_path, whisper_prompt)
-        else:
-            raw_text = _transcribe_one(audio_path, whisper_prompt)
-    except RuntimeError as e:
-        # 분할 불가(ffmpeg 미설치 등) → 사용자에게 명확히
-        logger.exception("큰 파일 변환 실패")
-        raise HTTPException(status_code=502, detail=f"음성 인식 실패: {e}")
-    except Exception as e:
-        logger.exception("Whisper STT 실패")
-        raise HTTPException(status_code=502, detail=f"음성 인식 실패: {e}")
 
-    if not raw_text:
-        raise HTTPException(
-            status_code=400,
-            detail="음성에서 텍스트를 추출하지 못했습니다 (무음이거나 너무 짧음)",
-        )
-
-    # 2) LLM 보정 (실패해도 원문 사용 → 데이터 유실 없음)
-    agenda_str = ", ".join(a.agenda for a in agenda_items if a.agenda)
-    cleaned = correct_transcription(
-        raw_text,
-        meeting_title=meeting.title if meeting else "",
-        agenda_list=agenda_str,
-        participants=meeting.participants if meeting else "",
-    )
-
-    # 3) 저장
-    try:
-        transcript.raw_text = cleaned
-        db.commit()
-        db.refresh(transcript)
-    except Exception as e:
-        db.rollback()
-        logger.exception("transcript 저장 실패")
-        raise HTTPException(status_code=500, detail=f"저장 실패: {e}")
-
+@router.get("/{meeting_id}/process-status")
+def process_status(meeting_id: int, db: Session = Depends(get_db)):
+    """변환 진행 상태 조회 (프론트 폴링용)."""
+    transcript = db.query(Transcript).filter(
+        Transcript.meeting_id == meeting_id
+    ).order_by(Transcript.transcript_id.desc()).first()
+    if not transcript:
+        raise HTTPException(status_code=404, detail="음성 파일이 없습니다")
     return {
         "meeting_id": meeting_id,
-        "status": "completed",
-        "raw_text": cleaned,
-        "original_text": raw_text,
+        # status가 비어있는데 raw_text가 있으면 과거(동기 시절)에 처리된 것 → completed로 간주
+        "status": transcript.process_status
+                  or ("completed" if transcript.raw_text else "idle"),
+        "raw_text": transcript.raw_text,
+        "error": transcript.process_error,
     }
+
+
+def _run_transcription(meeting_id: int, transcript_id: int):
+    """백그라운드에서 실제 변환을 수행한다. 자체 DB 세션을 연다
+    (요청 세션은 응답 후 닫히므로 재사용 불가)."""
+    db = SessionLocal()
+    try:
+        transcript = db.query(Transcript).filter(
+            Transcript.transcript_id == transcript_id
+        ).first()
+        if not transcript:
+            return
+
+        audio_path = ensure_local_file(transcript)
+        if not audio_path:
+            transcript.process_status = "failed"
+            transcript.process_error = "음성 파일이 존재하지 않습니다."
+            db.commit()
+            return
+        db.commit()  # 복원으로 audio_file_path 갱신됐으면 반영
+
+        try:
+            size = os.path.getsize(audio_path)
+        except OSError as e:
+            transcript.process_status = "failed"
+            transcript.process_error = f"파일 접근 실패: {e}"
+            db.commit()
+            return
+
+        meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
+        agenda_items = db.query(MeetingAgendaItem).filter(
+            MeetingAgendaItem.meeting_id == meeting_id
+        ).order_by(MeetingAgendaItem.order).all()
+
+        prompt_parts = ["한국어로 진행된 회의 녹음입니다."]
+        if meeting and meeting.title:
+            prompt_parts.append(f"회의 제목: {meeting.title}.")
+        agenda_text = ", ".join(a.agenda for a in agenda_items if a.agenda)
+        if agenda_text:
+            prompt_parts.append(f"주요 안건: {agenda_text}.")
+        if meeting and meeting.participants:
+            prompt_parts.append(f"참석자: {meeting.participants}.")
+        whisper_prompt = " ".join(prompt_parts)
+
+        # Whisper STT — 24MB 이하는 바로, 초과는 ffmpeg로 잘라 순차 변환
+        try:
+            if size > CHUNK_THRESHOLD:
+                logger.info("큰 파일(%dMB) → 분할 변환", size // (1024 * 1024))
+                raw_text = _transcribe_large(audio_path, whisper_prompt)
+            else:
+                raw_text = _transcribe_one(audio_path, whisper_prompt)
+        except Exception as e:
+            logger.exception("Whisper STT 실패")
+            transcript.process_status = "failed"
+            transcript.process_error = f"음성 인식 실패: {e}"
+            db.commit()
+            return
+
+        if not raw_text:
+            transcript.process_status = "failed"
+            transcript.process_error = "음성에서 텍스트를 추출하지 못했습니다 (무음이거나 너무 짧음)."
+            db.commit()
+            return
+
+        # LLM 보정 (실패해도 원문 사용 → 데이터 유실 없음)
+        agenda_str = ", ".join(a.agenda for a in agenda_items if a.agenda)
+        cleaned = correct_transcription(
+            raw_text,
+            meeting_title=meeting.title if meeting else "",
+            agenda_list=agenda_str,
+            participants=meeting.participants if meeting else "",
+        )
+
+        transcript.raw_text = cleaned
+        transcript.process_status = "completed"
+        transcript.process_error = None
+        db.commit()
+        logger.info("변환 완료: meeting %s", meeting_id)
+    except Exception as e:
+        logger.exception("백그라운드 변환 실패")
+        try:
+            t = db.query(Transcript).filter(
+                Transcript.transcript_id == transcript_id
+            ).first()
+            if t:
+                t.process_status = "failed"
+                t.process_error = f"변환 실패: {e}"
+                db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()

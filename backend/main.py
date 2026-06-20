@@ -23,6 +23,8 @@ def _run_lightweight_migrations():
         "transcripts": {
             "audio_data": f"ALTER TABLE transcripts ADD COLUMN audio_data {blob_type}",
             "audio_filename": "ALTER TABLE transcripts ADD COLUMN audio_filename VARCHAR",
+            "process_status": "ALTER TABLE transcripts ADD COLUMN process_status VARCHAR",
+            "process_error": "ALTER TABLE transcripts ADD COLUMN process_error TEXT",
         },
         "meeting_agenda_items": {
             "discussions": "ALTER TABLE meeting_agenda_items ADD COLUMN discussions TEXT",

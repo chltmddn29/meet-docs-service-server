@@ -46,7 +46,11 @@ class Transcript(Base):
     raw_text = Column(Text, nullable=True)
     processed_text = Column(Text, nullable=True)
     generated_at = Column(DateTime, default=datetime.utcnow)
-    
+    # 변환(STT) 진행 상태: None/'processing'/'completed'/'failed'.
+    # 긴 파일을 백그라운드로 변환하므로, 프론트가 이 상태를 폴링해서 완료를 안다.
+    process_status = Column(String, nullable=True)
+    process_error = Column(Text, nullable=True)
+
     meeting = relationship("Meeting", back_populates="transcripts")
 
 

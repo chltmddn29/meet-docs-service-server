@@ -16,7 +16,9 @@ if not _api_key:
         "GROQ_API_KEY 환경변수가 없습니다. STT/AI 기능이 동작하지 않습니다."
     )
 
-client = Groq(api_key=_api_key) if _api_key else None
+# 요청당 타임아웃을 명시(기본값이 너무 짧아 큰 청크에서 "Request timed out" 발생).
+# 청크는 10분 이하로 잘라 보내므로 조각당 180초면 충분히 여유.
+client = Groq(api_key=_api_key, timeout=180.0, max_retries=2) if _api_key else None
 
 # 회의 보정·분석에 쓰는 텍스트 모델.
 # Groq 무료 호스팅 중 가장 크고 강력한 모델(OpenAI 오픈 웨이트 120B).
