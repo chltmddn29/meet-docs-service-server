@@ -5,14 +5,74 @@ from models import Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client, ensure_client, TEXT_MODEL
 from routers.audio_store import ensure_local_file
 import os
+import shutil
+import subprocess
+import tempfile
+import glob
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/meetings", tags=["stt"])
 
-# 파일 변환 크기 제한 (1GB)
-MAX_AUDIO_BYTES = 1024 * 1024 * 1024
+# Groq Whisper 단일 파일 변환 상한(25MB). 이보다 크면 ffmpeg로 잘라 순차 변환.
+GROQ_FILE_LIMIT = 25 * 1024 * 1024
+# 안전 여유를 두고 24MB를 넘으면 분할 변환 경로로.
+CHUNK_THRESHOLD = 24 * 1024 * 1024
+# 분할 시 한 조각의 길이(초). opus 16kHz mono ~24kbps 기준 15분 ≈ 2~3MB로 한도에 여유.
+CHUNK_SECONDS = 900
+
+
+def _transcribe_one(path: str, whisper_prompt: str) -> str:
+    """파일 1개를 Groq Whisper로 변환해 텍스트 반환."""
+    with open(path, "rb") as audio_file:
+        result = client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-large-v3",
+            language="ko",
+            response_format="text",
+            temperature=0,
+            prompt=whisper_prompt,
+        )
+    return result.strip() if isinstance(result, str) else str(result).strip()
+
+
+def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
+    """25MB 초과 파일: ffmpeg로 시간 분할 → 각 조각을 순차 변환 → 이어붙임.
+    ffmpeg가 없으면 RuntimeError."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "큰 파일을 변환하려면 ffmpeg가 필요합니다(서버에 미설치)."
+        )
+    tmpdir = tempfile.mkdtemp(prefix="stt_chunks_")
+    try:
+        out_pattern = os.path.join(tmpdir, "chunk_%03d.ogg")
+        # 스트리밍 분할(저메모리): opus 16kHz mono로 재인코딩하며 시간 단위로 자름.
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-ar", "16000", "-ac", "1",
+            "-c:a", "libopus", "-b:a", "24k",
+            "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
+            out_pattern,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            logger.error("ffmpeg 분할 실패: %s", proc.stderr[-2000:])
+            raise RuntimeError("오디오 분할(ffmpeg)에 실패했습니다.")
+
+        chunks = sorted(glob.glob(os.path.join(tmpdir, "chunk_*.ogg")))
+        if not chunks:
+            raise RuntimeError("분할 결과가 없습니다(빈 오디오일 수 있음).")
+
+        parts = []
+        for i, ch in enumerate(chunks):
+            logger.info("청크 변환 %d/%d", i + 1, len(chunks))
+            text = _transcribe_one(ch, whisper_prompt)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def correct_transcription(text: str, meeting_title: str = "", agenda_list: str = "",
@@ -99,11 +159,6 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
 
     if size == 0:
         raise HTTPException(status_code=400, detail="음성 파일이 비어있습니다 (0 bytes)")
-    if size > MAX_AUDIO_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"음성 파일이 너무 큽니다 ({size // (1024*1024*1024)}GB, 최대 1GB)",
-        )
 
     # 회의 맥락(제목·안건·참석자)을 프롬프트로 주입 → 용어·이름 인식 정확도↑
     meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
@@ -121,18 +176,17 @@ def process_audio(meeting_id: int, db: Session = Depends(get_db)):
         prompt_parts.append(f"참석자: {meeting.participants}.")
     whisper_prompt = " ".join(prompt_parts)
 
-    # 1) Whisper STT — 실패 시 원인별로 구분된 메시지
+    # 1) Whisper STT — 25MB 이하는 바로, 초과는 ffmpeg로 잘라 순차 변환
     try:
-        with open(audio_path, "rb") as audio_file:
-            result = client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3",
-                language="ko",
-                response_format="text",
-                temperature=0,
-                prompt=whisper_prompt,
-            )
-        raw_text = result.strip() if isinstance(result, str) else str(result).strip()
+        if size > CHUNK_THRESHOLD:
+            logger.info("큰 파일(%dMB) → 분할 변환", size // (1024 * 1024))
+            raw_text = _transcribe_large(audio_path, whisper_prompt)
+        else:
+            raw_text = _transcribe_one(audio_path, whisper_prompt)
+    except RuntimeError as e:
+        # 분할 불가(ffmpeg 미설치 등) → 사용자에게 명확히
+        logger.exception("큰 파일 변환 실패")
+        raise HTTPException(status_code=502, detail=f"음성 인식 실패: {e}")
     except Exception as e:
         logger.exception("Whisper STT 실패")
         raise HTTPException(status_code=502, detail=f"음성 인식 실패: {e}")

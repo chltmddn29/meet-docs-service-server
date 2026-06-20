@@ -2,8 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 한글 폰트(나눔) 설치 — PDF 생성에 사용. (폰트를 git에 안 올리는 대신 시스템 설치)
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-nanum \
+# 한글 폰트(나눔) — PDF 생성용 / ffmpeg — 25MB 초과 오디오 분할 변환용
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-nanum ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # 의존성 먼저 설치 (레이어 캐시 활용)

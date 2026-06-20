@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Transcript
-from routers.audio_store import save_audio, ensure_local_file
+from routers.audio_store import save_audio_streamed, ensure_local_file
 from pydantic import BaseModel
 import os
 import logging
@@ -12,8 +12,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["audio"])
 
-# 파일 업로드 크기 제한 (1GB)
-MAX_AUDIO_BYTES = 1024 * 1024 * 1024
+# 업로드 허용 상한. 25MB를 넘는 파일도 변환 단계에서 자동 분할(청크)되므로 넉넉히 허용.
+# 단, 파일 전체를 메모리에 올리지 않고 디스크로 스트리밍 저장하므로 서버가 죽지 않는다.
+MAX_AUDIO_BYTES = 500 * 1024 * 1024  # 500MB
+# 디스크로 흘려보낼 때의 청크 크기(1MB) — 이 크기 이상은 한 번에 메모리에 올리지 않음.
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 
 class AudioResponse(BaseModel):
@@ -32,23 +35,29 @@ async def upload_audio(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
-    """음성 파일 업로드 — 바이트를 DB에 보관해 서버 재시작에도 유지."""
+    """음성 파일 업로드.
+    파일을 메모리에 통째로 올리지 않고 디스크로 청크 스트리밍 저장한다(서버 OOM 방지).
+    상한을 넘기면 받던 파일을 지우고 즉시 거부한다.
+    """
+    filename = file.filename or "audio.webm"
     try:
-        data = await file.read()
+        path, size = await _stream_to_disk(file, meeting_id, filename)
+    except ValueError as e:
+        raise HTTPException(status_code=413, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"파일 읽기 실패: {e}")
 
-    if not data:
+    if size == 0:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail="빈 파일입니다 (0 bytes)")
-    if len(data) > MAX_AUDIO_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"파일이 너무 큽니다 ({len(data)//(1024*1024*1024)}GB, 최대 1GB)",
-        )
 
     try:
         transcript = Transcript(meeting_id=meeting_id)
-        save_audio(transcript, data, file.filename or "audio.webm")
+        # 디스크에 이미 저장된 파일을 DB에 영속화(재시작 후에도 복원 가능).
+        save_audio_streamed(transcript, path, filename)
         db.add(transcript)
         db.commit()
         db.refresh(transcript)
@@ -57,6 +66,32 @@ async def upload_audio(
         db.rollback()
         logger.exception("오디오 업로드 저장 실패")
         raise HTTPException(status_code=500, detail=f"저장 실패: {e}")
+
+
+async def _stream_to_disk(file: UploadFile, meeting_id: int, filename: str):
+    """업로드 스트림을 청크 단위로 디스크에 쓴다. (경로, 총바이트)를 반환.
+    상한 초과 시 부분 파일을 지우고 ValueError를 던진다."""
+    from routers.audio_store import path_for, AUDIO_DIR
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    path = path_for(meeting_id, filename)
+    total = 0
+    with open(path, "wb") as out:
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_AUDIO_BYTES:
+                out.close()
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                raise ValueError(
+                    f"파일이 너무 큽니다 (최대 {MAX_AUDIO_BYTES//(1024*1024)}MB)"
+                )
+            out.write(chunk)
+    return path, total
 
 
 # 2. 음성 파일 목록 조회 — 실제 재생 가능한 것만 반환
