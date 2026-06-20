@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import glob
+import time
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,18 +24,45 @@ CHUNK_THRESHOLD = 24 * 1024 * 1024
 CHUNK_SECONDS = 600
 
 
-def _transcribe_one(path: str, whisper_prompt: str) -> str:
-    """파일 1개를 Groq Whisper로 변환해 텍스트 반환."""
-    with open(path, "rb") as audio_file:
-        result = client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3",
-            language="ko",
-            response_format="text",
-            temperature=0,
-            prompt=whisper_prompt,
-        )
-    return result.strip() if isinstance(result, str) else str(result).strip()
+# Groq가 일시적으로 뱉는 오류(과부하/속도제한/타임아웃) — 재시도하면 대개 성공.
+_TRANSIENT_HINTS = (
+    "502", "503", "429", "500",
+    "service_unavailable", "internal_server_error",
+    "timed out", "timeout", "connection", "rate limit",
+)
+
+
+def _is_transient(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(h in msg for h in _TRANSIENT_HINTS)
+
+
+def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 5) -> str:
+    """파일 1개를 Groq Whisper로 변환해 텍스트 반환.
+    Groq 일시 오류(502/503/429/timeout)는 지수 백오프로 재시도한다."""
+    last = None
+    for attempt in range(max_retries):
+        try:
+            with open(path, "rb") as audio_file:
+                result = client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3",
+                    language="ko",
+                    response_format="text",
+                    temperature=0,
+                    prompt=whisper_prompt,
+                )
+            return result.strip() if isinstance(result, str) else str(result).strip()
+        except Exception as e:
+            last = e
+            if attempt < max_retries - 1 and _is_transient(e):
+                wait = min(2 ** attempt * 2, 30)  # 2,4,8,16,30초
+                logger.warning("청크 변환 일시 오류, %d초 후 재시도(%d/%d): %s",
+                               wait, attempt + 1, max_retries, e)
+                time.sleep(wait)
+                continue
+            raise
+    raise last
 
 
 def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
@@ -65,11 +93,24 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
             raise RuntimeError("분할 결과가 없습니다(빈 오디오일 수 있음).")
 
         parts = []
+        failed = 0
         for i, ch in enumerate(chunks):
             logger.info("청크 변환 %d/%d", i + 1, len(chunks))
-            text = _transcribe_one(ch, whisper_prompt)
+            try:
+                text = _transcribe_one(ch, whisper_prompt)
+            except Exception as e:
+                # 한 청크가 끝내 실패해도 나머지는 살린다(부분 성공).
+                logger.warning("청크 %d 최종 실패(건너뜀): %s", i + 1, e)
+                parts.append(f"[※ {i + 1}번째 구간 인식 실패 — 다시 변환 권장]")
+                failed += 1
+                continue
             if text:
                 parts.append(text)
+            # Groq 과부하 회피용 청크 간 간격
+            if i < len(chunks) - 1:
+                time.sleep(2)
+        if failed == len(chunks):
+            raise RuntimeError("모든 구간 변환이 실패했습니다 (Groq 일시 오류). 잠시 후 다시 시도해주세요.")
         return "\n".join(parts).strip()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
