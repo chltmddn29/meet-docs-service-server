@@ -11,6 +11,7 @@ import tempfile
 import glob
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ GROQ_FILE_LIMIT = 25 * 1024 * 1024
 CHUNK_THRESHOLD = 24 * 1024 * 1024
 # 분할 시 한 조각의 길이(초). 10분이면 조각당 ~2MB로 작아 변환이 빠르고 타임아웃 안전.
 CHUNK_SECONDS = 600
+# 청크 동시 변환 수. 같은 모델로 병렬만 하므로 정확도엔 영향 없음.
+# 무료 플랜 속도제한과의 균형(너무 키우면 429 다발) — 6이면 1시간(6조각)을 한 번에.
+MAX_PARALLEL_CHUNKS = 6
 
 
 # Groq가 일시적으로 뱉는 오류(과부하/속도제한/타임아웃) — 재시도하면 대개 성공.
@@ -92,25 +96,29 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
         if not chunks:
             raise RuntimeError("분할 결과가 없습니다(빈 오디오일 수 있음).")
 
-        parts = []
+        # 청크를 동시에 변환(같은 모델 → 정확도 동일, 시간만 단축).
+        # 무료 플랜 속도제한을 감안해 동시 실행 수는 제한(429는 _transcribe_one이 재시도).
+        results: list = [None] * len(chunks)
         failed = 0
-        for i, ch in enumerate(chunks):
-            logger.info("청크 변환 %d/%d", i + 1, len(chunks))
+        workers = min(len(chunks), MAX_PARALLEL_CHUNKS)
+
+        def _work(item):
+            idx, ch = item
             try:
-                text = _transcribe_one(ch, whisper_prompt)
+                return idx, _transcribe_one(ch, whisper_prompt), True
             except Exception as e:
-                # 한 청크가 끝내 실패해도 나머지는 살린다(부분 성공).
-                logger.warning("청크 %d 최종 실패(건너뜀): %s", i + 1, e)
-                parts.append(f"[※ {i + 1}번째 구간 인식 실패 — 다시 변환 권장]")
-                failed += 1
-                continue
-            if text:
-                parts.append(text)
-            # Groq 과부하 회피용 청크 간 간격
-            if i < len(chunks) - 1:
-                time.sleep(2)
+                logger.warning("청크 %d 최종 실패(건너뜀): %s", idx + 1, e)
+                return idx, f"[※ {idx + 1}번째 구간 인식 실패 — 다시 변환 권장]", False
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for idx, text, ok in ex.map(_work, list(enumerate(chunks))):
+                results[idx] = text
+                if not ok:
+                    failed += 1
+
         if failed == len(chunks):
             raise RuntimeError("모든 구간 변환이 실패했습니다 (Groq 일시 오류). 잠시 후 다시 시도해주세요.")
+        parts = [r for r in results if r]
         return "\n".join(parts).strip()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
