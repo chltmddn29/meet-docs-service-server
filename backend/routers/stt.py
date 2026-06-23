@@ -129,50 +129,59 @@ def correct_transcription(text: str, meeting_title: str = "", agenda_list: str =
     """STT 결과를 '말하려던 것'으로 다듬기: 영어 기술용어 음차 → 올바른 영어 표기
     + 회의 맥락 기반 용어 교정. 실패하면 원문을 그대로 반환(보정은 부가기능).
     """
-    context_parts = []
+    # 맥락은 '용어 교정 참고용'으로만 — 본문에 절대 출력되면 안 됨.
+    ref_parts = []
     if meeting_title:
-        context_parts.append(f"회의 제목: {meeting_title}")
+        ref_parts.append(f"- 제목: {meeting_title}")
     if agenda_list:
-        context_parts.append(f"안건: {agenda_list}")
+        ref_parts.append(f"- 안건: {agenda_list}")
     if participants:
-        context_parts.append(f"참석자: {participants}")
-    context_str = "\n".join(context_parts)
+        ref_parts.append(f"- 참석자: {participants}")
+    ref_str = "\n".join(ref_parts) if ref_parts else "(없음)"
 
-    system_prompt = """당신은 한국어 회의 STT(음성인식) 결과를 다듬는 편집자입니다.
-화자가 말하려던 바를 읽기 쉽게 정리하되, 아래 규칙을 엄격히 지키세요.
+    system_prompt = """너는 한국어 회의 STT(음성인식) 결과의 '오타 교정기'다.
+화자가 실제로 말한 그대로를 보존하는 것이 최우선이며, 아래를 엄격히 지켜라.
 
-[교정할 것]
-1. 영어 기술용어·브랜드·제품명의 한글 음차를 올바른 영어 표기로 변환
-   예) "패스트 API"/"패스트에이피아이" → "FastAPI", "리버파드" → "Riverpod",
-       "플러터" → "Flutter", "리액트" → "React", "깃허브" → "GitHub",
-       "자바스크립트" → "JavaScript"
-2. 명백한 STT 오인식(잘못된 조사·발음)만 자연스럽게 교정
-   예) "후로" → "으로", "햇습니다" → "했습니다"
-3. 말 더듬기·중복·군더더기는 정리해 읽기 쉽게
-4. 회의 맥락에 맞는 도메인 용어를 올바르게 교정 (아래 회의 정보 참고)
-5. 문장 경계에 맞춰 마침표·쉼표·물음표 등 문장 부호를 넣어 읽기 쉽게
-6. 화제(주제)가 바뀌는 지점에서 문단을 나눠 정리 (빈 줄로 구분)
+[허용 — 이것만 한다]
+1. 영어 기술용어·브랜드·제품명의 한글 음차를 올바른 영어 표기로만 변환.
+   예) "패스트에이피아이"→"FastAPI", "리버파드"→"Riverpod", "플러터"→"Flutter",
+       "깃허브"→"GitHub"
+2. 명백한 음성인식 오타(잘못된 조사·받침)만 자연스럽게 교정.
+   예) "햇습니다"→"했습니다"
+3. 문장 끝에 마침표·물음표 정도의 최소한의 문장부호만 보완.
 
-[금지]
-- 내용을 추가/삭제/요약/재구성하지 말 것. 화자가 말한 의미를 그대로 보존.
-- 없는 정보를 지어내지 말 것. 애매하면 원문을 유지.
-- 교정된 본문만 출력(설명·머리말 없이).
+[절대 금지]
+- 요약·축약·재구성·문단 재배치 금지. 길이와 순서를 원문과 거의 같게 유지.
+- 중복이나 군더더기처럼 보여도 임의로 지우지 말 것(화자가 실제로 반복했을 수 있음).
+- 없는 내용을 지어내지 말 것. 못 알아듣는 부분은 원문 그대로 둘 것.
+- "회의 제목:", "안건:", "Q:", "A:", "■", "**굵게**", "#", "-목록" 등
+  어떤 제목·라벨·머리말·마크다운 서식도 추가 금지. 아래 [참고 정보]를 본문에 옮겨 적지 말 것.
+- 화자 이름이나 "화자1:" 같은 발화자 표시도 새로 만들지 말 것.
 
-[회의 정보]
-""" + (context_str if context_str else "(맥락 정보 없음)")
+[출력]
+- 교정된 본문만 출력. 설명·머리말 없이, 원문과 거의 동일한 분량으로.
+
+[참고 정보 — 용어 교정에만 참고, 절대 본문에 출력 금지]
+""" + ref_str
 
     try:
         response = client.chat.completions.create(
             model=TEXT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"다음 텍스트를 보정해주세요:\n{text}"},
+                {"role": "user", "content": f"다음 텍스트의 오타만 교정해줘:\n{text}"},
             ],
             temperature=0,
         )
         result = response.choices[0].message.content.strip()
-        # 빈 응답이면 원문 유지
-        return result if result else text
+        if not result:
+            return text
+        # 안전장치: 보정 결과가 원문보다 크게 짧아지면(요약/뭉개기 의심) 원문 사용.
+        if len(result) < len(text) * 0.6:
+            logger.warning("보정 결과가 과도하게 짧음(%d→%d) → 원문 사용",
+                           len(text), len(result))
+            return text
+        return result
     except Exception as e:
         # 보정 실패는 치명적이지 않다 → Whisper 원문을 그대로 사용
         logger.warning("LLM 보정 실패, 원문 사용: %s", e)
