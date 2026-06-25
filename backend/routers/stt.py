@@ -24,8 +24,9 @@ CHUNK_THRESHOLD = 24 * 1024 * 1024
 # 분할 시 한 조각의 길이(초). 10분이면 조각당 ~2MB로 작아 변환이 빠르고 타임아웃 안전.
 CHUNK_SECONDS = 600
 # 청크 동시 변환 수. 같은 모델로 병렬만 하므로 정확도엔 영향 없음.
-# 무료 플랜 속도제한과의 균형(너무 키우면 429 다발) — 6이면 1시간(6조각)을 한 번에.
-MAX_PARALLEL_CHUNKS = 6
+# 무료 플랜은 시간당 오디오 7,200초 한도라 6개 동시(=한 번에 3,600초)면 재시도 한두 번에
+# 시간당 쿼터를 넘겨 429가 다발한다 → 보수적으로 3으로 낮춰 버스트를 줄인다.
+MAX_PARALLEL_CHUNKS = 3
 
 
 # Groq가 일시적으로 뱉는 오류(과부하/속도제한/타임아웃) — 재시도하면 대개 성공.
@@ -41,9 +42,26 @@ def _is_transient(err: Exception) -> bool:
     return any(h in msg for h in _TRANSIENT_HINTS)
 
 
-def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 5) -> str:
+def _retry_after_seconds(err: Exception) -> float | None:
+    """429 응답의 Retry-After 헤더(초)를 읽어온다. 없으면 None.
+    Groq가 '시간당 오디오 한도 초과'를 알릴 때 정확한 대기시간을 여기로 준다."""
+    resp = getattr(err, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    val = headers.get("retry-after") or headers.get("Retry-After")
+    if not val:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 6) -> str:
     """파일 1개를 Groq Whisper로 변환해 텍스트 반환.
-    Groq 일시 오류(502/503/429/timeout)는 지수 백오프로 재시도한다."""
+    Groq 일시 오류(502/503/429/timeout)는 재시도한다. 429면 응답의 Retry-After를
+    존중해 그만큼 기다린다(시간당 오디오 쿼터 창은 30초 백오프로는 안 풀리므로)."""
     last = None
     for attempt in range(max_retries):
         try:
@@ -60,8 +78,13 @@ def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 5) -> str
         except Exception as e:
             last = e
             if attempt < max_retries - 1 and _is_transient(e):
-                wait = min(2 ** attempt * 2, 30)  # 2,4,8,16,30초
-                logger.warning("청크 변환 일시 오류, %d초 후 재시도(%d/%d): %s",
+                # 서버가 알려준 대기시간이 있으면 우선 사용(429 쿼터), 없으면 지수 백오프.
+                ra = _retry_after_seconds(e)
+                if ra is not None:
+                    wait = min(ra + 1, 90)  # 헤더값 +여유, 최대 90초
+                else:
+                    wait = min(2 ** attempt * 2, 60)  # 2,4,8,16,32,60초
+                logger.warning("청크 변환 일시 오류, %.0f초 후 재시도(%d/%d): %s",
                                wait, attempt + 1, max_retries, e)
                 time.sleep(wait)
                 continue
@@ -99,7 +122,6 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
         # 청크를 동시에 변환(같은 모델 → 정확도 동일, 시간만 단축).
         # 무료 플랜 속도제한을 감안해 동시 실행 수는 제한(429는 _transcribe_one이 재시도).
         results: list = [None] * len(chunks)
-        failed = 0
         workers = min(len(chunks), MAX_PARALLEL_CHUNKS)
 
         def _work(item):
@@ -107,16 +129,28 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
             try:
                 return idx, _transcribe_one(ch, whisper_prompt), True
             except Exception as e:
-                logger.warning("청크 %d 최종 실패(건너뜀): %s", idx + 1, e)
-                return idx, f"[※ {idx + 1}번째 구간 인식 실패 — 다시 변환 권장]", False
+                logger.warning("청크 %d 1차 실패: %s", idx + 1, e)
+                return idx, None, False
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for idx, text, ok in ex.map(_work, list(enumerate(chunks))):
-                results[idx] = text
-                if not ok:
-                    failed += 1
+                results[idx] = text if ok else None
 
-        if failed == len(chunks):
+        # 2차 패스: 실패한 구간만 잠시 쉬었다가 순차로(동시성 0) 다시 시도.
+        # 1차 실패가 시간당 쿼터 소진(429)이면 버스트를 멈추고 천천히 재시도해야 풀린다.
+        failed_idx = [i for i, r in enumerate(results) if r is None]
+        if failed_idx:
+            logger.info("실패 구간 %d개 → 30초 후 순차 재시도", len(failed_idx))
+            time.sleep(30)
+            for i in failed_idx:
+                try:
+                    results[i] = _transcribe_one(chunks[i], whisper_prompt)
+                    logger.info("청크 %d 2차 재시도 성공", i + 1)
+                except Exception as e:
+                    logger.warning("청크 %d 최종 실패(건너뜀): %s", i + 1, e)
+                    results[i] = f"[※ {i + 1}번째 구간 인식 실패 — 다시 변환 권장]"
+
+        if all(r is None or r.startswith("[※ ") for r in results):
             raise RuntimeError("모든 구간 변환이 실패했습니다 (Groq 일시 오류). 잠시 후 다시 시도해주세요.")
         parts = [r for r in results if r]
         return "\n".join(parts).strip()
