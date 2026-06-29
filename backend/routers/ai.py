@@ -37,6 +37,8 @@ def _build_user_prompt(raw_text: str, participants: str = "") -> str:
 }}
 
 작성 규칙:
+- 영어 기술용어·브랜드·제품명이 한글로 음차된 경우 올바른 영어 표기로 바로잡아 쓰세요.
+  예) "패스트에이피아이"→"FastAPI", "리버파드"→"Riverpod", "플러터"→"Flutter", "깃허브"→"GitHub"
 - content는 핵심만 압축하지 말고 맥락이 드러나게 구체적으로 적으세요.
 - discussions에는 찬반·대안·우려 등 회의에서 실제 나온 의견을 빠짐없이 담으세요.
 - completed_items(한 일)와 action_items(할 일)를 명확히 구분하세요.
