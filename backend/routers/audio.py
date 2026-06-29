@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
-from database import get_db
-from models import Transcript
-from routers.audio_store import save_audio_streamed, ensure_local_file
+from database import get_db, SessionLocal
+from models import Transcript, Meeting
+from routers.audio_store import ensure_local_file, MAX_DB_BLOB_BYTES
 from pydantic import BaseModel
 import os
 import logging
@@ -28,16 +28,19 @@ class AudioResponse(BaseModel):
         from_attributes = True
 
 
-# 1. 음성 파일 업로드 (DB + 디스크 동시 저장)
+# 1. 음성 파일 업로드 (디스크 저장 후 즉시 응답, DB 영속화는 백그라운드)
 @router.post("/meetings/{meeting_id}/upload-audio", response_model=AudioResponse)
 async def upload_audio(
     meeting_id: int,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     """음성 파일 업로드.
     파일을 메모리에 통째로 올리지 않고 디스크로 청크 스트리밍 저장한다(서버 OOM 방지).
     상한을 넘기면 받던 파일을 지우고 즉시 거부한다.
+    DB 영구 보관(BLOB)은 응답 뒤 백그라운드로 처리해 업로드 체감 시간을 줄인다
+    (원격 DB로의 2차 전송을 임계경로에서 제거). 변환은 디스크 파일로 진행되므로 영향 없음.
     """
     filename = file.filename or "audio.webm"
     try:
@@ -55,17 +58,50 @@ async def upload_audio(
         raise HTTPException(status_code=400, detail="빈 파일입니다 (0 bytes)")
 
     try:
-        transcript = Transcript(meeting_id=meeting_id)
-        # 디스크에 이미 저장된 파일을 DB에 영속화(재시작 후에도 복원 가능).
-        save_audio_streamed(transcript, path, filename)
+        # 디스크 경로만으로 먼저 레코드 생성(빠름). DB BLOB는 백그라운드에서 채운다.
+        transcript = Transcript(
+            meeting_id=meeting_id,
+            audio_filename=filename,
+            audio_file_path=path,
+        )
         db.add(transcript)
         db.commit()
         db.refresh(transcript)
-        return transcript
     except Exception as e:
         db.rollback()
         logger.exception("오디오 업로드 저장 실패")
         raise HTTPException(status_code=500, detail=f"저장 실패: {e}")
+
+    # 영구 보관용 BLOB 저장은 응답 후 백그라운드로 (재시작 대비)
+    background_tasks.add_task(_persist_audio_blob, transcript.transcript_id, path)
+    return transcript
+
+
+def _persist_audio_blob(transcript_id: int, path: str):
+    """업로드 응답 후 백그라운드에서 오디오 바이트를 DB에 영속화(재시작 후 복원용).
+    너무 크면(>MAX_DB_BLOB_BYTES) 생략하고 디스크에만 둔다."""
+    db = SessionLocal()
+    try:
+        t = db.query(Transcript).filter(
+            Transcript.transcript_id == transcript_id
+        ).first()
+        if not t:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size > MAX_DB_BLOB_BYTES:
+            logger.info("큰 오디오(%dMB) DB BLOB 생략, 디스크 보관", size // (1024 * 1024))
+            return
+        with open(path, "rb") as f:
+            t.audio_data = f.read()
+        db.commit()
+    except Exception as e:
+        logger.warning("오디오 BLOB 백그라운드 저장 실패(tid=%s): %s", transcript_id, e)
+        db.rollback()
+    finally:
+        db.close()
 
 
 async def _stream_to_disk(file: UploadFile, meeting_id: int, filename: str):
@@ -181,3 +217,38 @@ def delete_audio_file(transcript_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"삭제 실패: {e}")
 
     return {"message": "Audio file deleted"}
+
+
+# 5. 음성으로 새 회의 만들기 — 회의가 삭제돼 고아가 된 음성을 다시 회의록으로 생성할 때 사용
+@router.post("/audio-files/{transcript_id}/new-meeting")
+def new_meeting_from_audio(transcript_id: int, db: Session = Depends(get_db)):
+    """음성에 연결된 회의가 없으면(삭제됨) 새 회의를 만들어 연결하고 meeting_id를 돌려준다.
+    이미 연결된 회의가 있으면 그 meeting_id를 그대로 반환한다."""
+    transcript = db.query(Transcript).filter(
+        Transcript.transcript_id == transcript_id
+    ).first()
+    if not transcript:
+        raise HTTPException(status_code=404, detail="음성 기록을 찾을 수 없습니다")
+
+    # 이미 회의가 있으면 그대로 사용
+    if transcript.meeting_id:
+        meeting = db.query(Meeting).filter(
+            Meeting.meeting_id == transcript.meeting_id
+        ).first()
+        if meeting:
+            return {"meeting_id": meeting.meeting_id, "transcript_id": transcript_id}
+
+    title = "재생성된 회의"
+    if transcript.audio_filename:
+        base = os.path.splitext(transcript.audio_filename)[0].strip()
+        if base:
+            title = base
+
+    meeting = Meeting(title=title, status="recording")
+    db.add(meeting)
+    db.commit()
+    db.refresh(meeting)
+
+    transcript.meeting_id = meeting.meeting_id
+    db.commit()
+    return {"meeting_id": meeting.meeting_id, "transcript_id": transcript_id}

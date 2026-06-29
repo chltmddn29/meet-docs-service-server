@@ -69,19 +69,18 @@ def get_meetings(db: Session = Depends(get_db)):
 # 2-1. 회의 삭제 (연관 데이터 모두 정리)
 @router.delete("/{meeting_id}")
 def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
-    """회의와 연관 데이터(안건·음성·저장파일)를 모두 삭제"""
+    """회의와 회의록(안건·저장본)을 삭제한다.
+    단, 음성(transcript)은 보존한다 — 회의를 지워도 녹음은 '음성 기록'에 남겨
+    재생/다운로드하거나 새 회의록으로 다시 생성할 수 있게 한다(연결만 끊어 고아로 둠)."""
     meeting = db.query(Meeting).filter(Meeting.meeting_id == meeting_id).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="회의를 찾을 수 없습니다")
 
-    # 디스크 파일 정리 (음성 + 저장된 문서)
-    transcripts = db.query(Transcript).filter(
-        Transcript.meeting_id == meeting_id
-    ).all()
+    # 저장된 문서(PlatformSave) 디스크 파일만 정리 — 음성 파일은 보존한다.
     saves = db.query(PlatformSave).filter(
         PlatformSave.meeting_id == meeting_id
     ).all()
-    for f in [t.audio_file_path for t in transcripts] + [s.platform_doc_id for s in saves]:
+    for f in [s.platform_doc_id for s in saves]:
         try:
             if f and os.path.exists(f):
                 os.remove(f)
@@ -93,12 +92,13 @@ def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
         db.query(MeetingAgendaItem).filter(
             MeetingAgendaItem.meeting_id == meeting_id
         ).delete()
-        db.query(Transcript).filter(
-            Transcript.meeting_id == meeting_id
-        ).delete()
         db.query(PlatformSave).filter(
             PlatformSave.meeting_id == meeting_id
         ).delete()
+        # 음성은 삭제하지 않고 회의와의 연결만 끊는다(고아로 보존).
+        db.query(Transcript).filter(
+            Transcript.meeting_id == meeting_id
+        ).update({Transcript.meeting_id: None}, synchronize_session=False)
         db.delete(meeting)
         db.commit()
     except Exception as e:
