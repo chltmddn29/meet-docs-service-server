@@ -6,6 +6,13 @@ from database import Base, engine
 from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, Template, FormatTemplate
 from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos, hwpx, action_items
 
+# 앱 모듈(routers.*)의 INFO 로그가 HF Space 로그에 보이도록 설정.
+# (uvicorn은 자기 로거만 설정하므로, 이게 없으면 logger.info()가 전부 묻힘)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 logger = logging.getLogger(__name__)
 
 # 데이터베이스 테이블 생성
