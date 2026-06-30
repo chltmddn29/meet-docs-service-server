@@ -7,13 +7,18 @@ from models import User, Meeting, Transcript, MeetingAgendaItem, PlatformSave, T
 from routers import meetings, stt, audio, ai, markdown, pdf, docx, notion, preview, templates, format_templates, todos, hwpx, action_items
 
 # 앱 모듈(routers.*)의 INFO 로그가 HF Space 로그에 보이도록 설정.
-# (uvicorn은 자기 로거만 설정하므로, 이게 없으면 logger.info()가 전부 묻힘)
+# uvicorn이 먼저 로깅을 구성하면 basicConfig가 no-op이 되므로 force=True로 강제 적용,
+# 추가로 root/routers 로거 레벨을 명시적으로 INFO로 내린다(전부 묻히는 것 방지).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    force=True,
 )
+logging.getLogger().setLevel(logging.INFO)
+logging.getLogger("routers").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+logger.info("INFO 로깅 활성화됨 — 단계별 타이밍 로그가 출력됩니다")
 
 # 데이터베이스 테이블 생성
 Base.metadata.create_all(bind=engine)
