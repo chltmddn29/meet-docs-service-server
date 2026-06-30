@@ -67,6 +67,8 @@ def analyze_and_save(meeting_id: int, raw_text: str, db: Session) -> list:
     participants = meeting.participants if meeting and meeting.participants else ""
 
     # 1) LLM 호출
+    import time
+    t0 = time.monotonic()
     try:
         response = client.chat.completions.create(
             model=TEXT_MODEL,
@@ -77,6 +79,8 @@ def analyze_and_save(meeting_id: int, raw_text: str, db: Session) -> list:
             temperature=0.3,
         )
         response_text = response.choices[0].message.content
+        logger.info("AI 분석 LLM 완료 (%.1fs, 입력 %d자)",
+                    time.monotonic() - t0, len(raw_text))
     except Exception as e:
         logger.exception("AI 분석 호출 실패")
         raise HTTPException(status_code=502, detail=f"AI 분석 실패: {e}")

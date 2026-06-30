@@ -103,10 +103,11 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
     try:
         out_pattern = os.path.join(tmpdir, "chunk_%03d.ogg")
         # 스트리밍 분할(저메모리): opus 16kHz mono로 재인코딩하며 시간 단위로 자름.
+        # compression_level 0 = 가장 빠른 인코딩(음성인식엔 품질 영향 없음).
         cmd = [
             "ffmpeg", "-y", "-i", audio_path,
             "-ar", "16000", "-ac", "1",
-            "-c:a", "libopus", "-b:a", "24k",
+            "-c:a", "libopus", "-b:a", "24k", "-compression_level", "0",
             "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
             out_pattern,
         ]
@@ -156,6 +157,31 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
         return "\n".join(parts).strip()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _compact_audio(audio_path: str) -> str | None:
+    """전체 오디오를 음성인식용 저용량 opus(16kHz mono)로 한 번에 재인코딩한 임시 파일 경로 반환.
+    이렇게 줄이면 긴 회의도 Groq 25MB 한도 안에 들어와 '분할 없이 한 번에' 변환할 수 있다.
+    ffmpeg가 없거나 실패하면 None(→ 호출부가 기존 분할 경로로 폴백)."""
+    if not shutil.which("ffmpeg"):
+        return None
+    fd, out = tempfile.mkstemp(prefix="stt_compact_", suffix=".ogg")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_path,
+        "-ar", "16000", "-ac", "1",
+        "-c:a", "libopus", "-b:a", "24k", "-compression_level", "0",
+        out,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+        logger.error("ffmpeg 컴팩트 재인코딩 실패: %s", proc.stderr[-1000:])
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return None
+    return out
 
 
 @router.post("/{meeting_id}/process")
@@ -269,13 +295,37 @@ def _run_transcription(meeting_id: int, transcript_id: int):
             prompt_parts.append(f"참석자: {meeting.participants}.")
         whisper_prompt = " ".join(prompt_parts)
 
-        # Whisper STT — 24MB 이하는 바로, 초과는 ffmpeg로 잘라 순차 변환
+        # Whisper STT
+        #  - 24MB 이하: 원본을 바로 변환
+        #  - 초과: 먼저 저용량 opus로 재인코딩 → 25MB 한도에 들어오면 '한 번에' 변환,
+        #          그래도 크면(아주 긴 회의) 그때만 분할. → 대부분의 회의가 단일 호출로 빨라짐.
+        t0 = time.monotonic()
         try:
             if size > CHUNK_THRESHOLD:
-                logger.info("큰 파일(%dMB) → 분할 변환", size // (1024 * 1024))
-                raw_text = _transcribe_large(audio_path, whisper_prompt)
+                compact = _compact_audio(audio_path)
+                if compact:
+                    try:
+                        csize = os.path.getsize(compact)
+                        logger.info("재인코딩 %dMB → %dMB (%.1fs)",
+                                    size // (1024 * 1024), csize // (1024 * 1024),
+                                    time.monotonic() - t0)
+                        if csize <= CHUNK_THRESHOLD:
+                            raw_text = _transcribe_one(compact, whisper_prompt)
+                        else:
+                            logger.info("재인코딩 후도 큼 → 분할 변환")
+                            raw_text = _transcribe_large(compact, whisper_prompt)
+                    finally:
+                        try:
+                            os.remove(compact)
+                        except OSError:
+                            pass
+                else:
+                    # ffmpeg 미설치/실패 → 기존 분할 경로로 폴백
+                    logger.info("컴팩트 재인코딩 불가 → 분할 변환")
+                    raw_text = _transcribe_large(audio_path, whisper_prompt)
             else:
                 raw_text = _transcribe_one(audio_path, whisper_prompt)
+            logger.info("STT 완료 (%.1fs, meeting %s)", time.monotonic() - t0, meeting_id)
         except Exception as e:
             logger.exception("Whisper STT 실패")
             transcript.process_status = "failed"
