@@ -10,3 +10,4 @@ python-docx
 notion-client
 psycopg2-binary
 olefile
+pyannote.audio

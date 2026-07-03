@@ -4,6 +4,7 @@ from database import get_db, SessionLocal
 from models import Transcript, Meeting, MeetingAgendaItem
 from routers.groq_client import client, ensure_client, TEXT_MODEL
 from routers.audio_store import ensure_local_file
+from routers.diarization import diarize
 import os
 import shutil
 import subprocess
@@ -58,8 +59,36 @@ def _retry_after_seconds(err: Exception) -> float | None:
         return None
 
 
-def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 6) -> str:
-    """파일 1개를 Groq Whisper로 변환해 텍스트 반환.
+def _extract_segments(result) -> list[dict]:
+    """Groq verbose_json 응답에서 [{start, end, text}] 리스트를 뽑는다(화자분리 정렬용
+    타임스탬프). 세그먼트 정보가 없으면(응답 형식 변화 등) 전체 텍스트를 단일
+    세그먼트로 감싸 폴백한다."""
+    segments = getattr(result, "segments", None)
+    if segments is None and isinstance(result, dict):
+        segments = result.get("segments")
+    out = []
+    for s in segments or []:
+        if isinstance(s, dict):
+            start, end, text = s.get("start"), s.get("end"), s.get("text", "")
+        else:
+            start, end, text = getattr(s, "start", None), getattr(s, "end", None), getattr(s, "text", "")
+        text = (text or "").strip()
+        if not text:
+            continue
+        out.append({"start": float(start or 0.0), "end": float(end or 0.0), "text": text})
+    if out:
+        return out
+
+    full_text = getattr(result, "text", None)
+    if full_text is None and isinstance(result, dict):
+        full_text = result.get("text")
+    full_text = (full_text or "").strip()
+    return [{"start": 0.0, "end": 0.0, "text": full_text}] if full_text else []
+
+
+def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 6) -> list[dict]:
+    """파일 1개를 Groq Whisper로 변환해 세그먼트 리스트([{start,end,text}], 파일 내
+    상대 시간)로 반환한다. 세그먼트 타임스탬프는 화자분리 결과와 정렬하는 데 쓴다.
     Groq 일시 오류(502/503/429/timeout)는 재시도한다. 429면 응답의 Retry-After를
     존중해 그만큼 기다린다(시간당 오디오 쿼터 창은 30초 백오프로는 안 풀리므로)."""
     last = None
@@ -70,11 +99,12 @@ def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 6) -> str
                     file=audio_file,
                     model="whisper-large-v3",
                     language="ko",
-                    response_format="text",
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"],
                     temperature=0,
                     prompt=whisper_prompt,
                 )
-            return result.strip() if isinstance(result, str) else str(result).strip()
+            return _extract_segments(result)
         except Exception as e:
             last = e
             if attempt < max_retries - 1 and _is_transient(e):
@@ -92,8 +122,10 @@ def _transcribe_one(path: str, whisper_prompt: str, max_retries: int = 6) -> str
     raise last
 
 
-def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
-    """25MB 초과 파일: ffmpeg로 시간 분할 → 각 조각을 순차 변환 → 이어붙임.
+def _transcribe_large(audio_path: str, whisper_prompt: str) -> list[dict]:
+    """25MB 초과 파일: ffmpeg로 시간 분할 → 각 조각을 순차 변환 → 세그먼트를 원본
+    타임라인 기준으로 이어붙임(각 청크 세그먼트에 chunk_index*CHUNK_SECONDS를 더해
+    시간 오프셋 보정 — 화자분리 결과와 정렬하려면 전체 오디오 기준 시간이 필요).
     ffmpeg가 없으면 RuntimeError."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError(
@@ -121,7 +153,7 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
 
         # 청크를 동시에 변환(같은 모델 → 정확도 동일, 시간만 단축).
         # 무료 플랜 속도제한을 감안해 동시 실행 수는 제한(429는 _transcribe_one이 재시도).
-        results: list = [None] * len(chunks)
+        results: list = [None] * len(chunks)  # 각 원소: 그 청크의 세그먼트 리스트(파일 내 상대 시간) 또는 실패 시 None
         workers = min(len(chunks), MAX_PARALLEL_CHUNKS)
 
         def _work(item):
@@ -133,8 +165,8 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
                 return idx, None, False
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for idx, text, ok in ex.map(_work, list(enumerate(chunks))):
-                results[idx] = text if ok else None
+            for idx, segs, ok in ex.map(_work, list(enumerate(chunks))):
+                results[idx] = segs if ok else None
 
         # 2차 패스: 실패한 구간만 잠시 쉬었다가 순차로(동시성 0) 다시 시도.
         # 1차 실패가 시간당 쿼터 소진(429)이면 버스트를 멈추고 천천히 재시도해야 풀린다.
@@ -148,12 +180,29 @@ def _transcribe_large(audio_path: str, whisper_prompt: str) -> str:
                     logger.info("청크 %d 2차 재시도 성공", i + 1)
                 except Exception as e:
                     logger.warning("청크 %d 최종 실패(건너뜀): %s", i + 1, e)
-                    results[i] = f"[※ {i + 1}번째 구간 인식 실패 — 다시 변환 권장]"
+                    results[i] = None  # 최종 실패 → 아래에서 플레이스홀더 세그먼트로 대체
 
-        if all(r is None or r.startswith("[※ ") for r in results):
+        if all(r is None for r in results):
             raise RuntimeError("모든 구간 변환이 실패했습니다 (Groq 일시 오류). 잠시 후 다시 시도해주세요.")
-        parts = [r for r in results if r]
-        return "\n".join(parts).strip()
+
+        # 청크별 상대 시간을 원본 오디오 기준 절대 시간으로 환산해 하나로 이어붙인다.
+        global_segments: list[dict] = []
+        for idx, segs in enumerate(results):
+            offset = idx * CHUNK_SECONDS
+            if segs:
+                for s in segs:
+                    global_segments.append({
+                        "start": s["start"] + offset,
+                        "end": s["end"] + offset,
+                        "text": s["text"],
+                    })
+            else:
+                global_segments.append({
+                    "start": offset,
+                    "end": offset + CHUNK_SECONDS,
+                    "text": f"[※ {idx + 1}번째 구간 인식 실패 — 다시 변환 권장]",
+                })
+        return global_segments
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -183,6 +232,66 @@ def _compact_audio(audio_path: str) -> str | None:
             pass
         return None
     return out
+
+
+def _diarization_wav(audio_path: str) -> str | None:
+    """화자분리 입력용 16kHz mono WAV로 변환한 임시 파일 경로 반환.
+    (Groq용 _compact_audio의 opus와는 별도 — pyannote가 안정적으로 읽을 수 있는
+    포맷으로 맞춘다.) ffmpeg가 없거나 실패하면 None(→ 호출부가 화자 라벨 없이 진행)."""
+    if not shutil.which("ffmpeg"):
+        return None
+    fd, out = tempfile.mkstemp(prefix="stt_diar_", suffix=".wav")
+    os.close(fd)
+    cmd = ["ffmpeg", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", out]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+        logger.warning("화자분리용 WAV 변환 실패: %s", proc.stderr[-1000:])
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        return None
+    return out
+
+
+def _label_for(seg: dict, speaker_segments: list[tuple] | None) -> str | None:
+    """세그먼트 시간과 가장 많이 겹치는 화자 라벨을 찾는다. 화자분리 결과가 없으면 None."""
+    if not speaker_segments:
+        return None
+    best_label, best_overlap = None, 0.0
+    for s_start, s_end, label in speaker_segments:
+        overlap = min(seg["end"], s_end) - max(seg["start"], s_start)
+        if overlap > best_overlap:
+            best_overlap, best_label = overlap, label
+    return best_label
+
+
+def _compose_transcript(segments: list[dict], speaker_segments: list[tuple] | None) -> str:
+    """Whisper 세그먼트를 화자별 문단으로 묶어 텍스트로 합친다.
+    화자분리 결과가 있으면 화자가 바뀔 때마다, 없으면 2초 이상 뜸이 있을 때마다
+    문단을 나눈다(둘 다 없을 때보다 읽기 좋게)."""
+    if not segments:
+        return ""
+    paragraphs: list[str] = []
+    cur_label = _label_for(segments[0], speaker_segments)
+    cur_texts = [segments[0]["text"]]
+    prev_end = segments[0]["end"]
+
+    for seg in segments[1:]:
+        label = _label_for(seg, speaker_segments)
+        same_group = (label == cur_label) if speaker_segments else (seg["start"] - prev_end < 2.0)
+        if same_group:
+            cur_texts.append(seg["text"])
+        else:
+            prefix = f"{cur_label}: " if cur_label else ""
+            paragraphs.append(prefix + " ".join(cur_texts))
+            cur_label = label
+            cur_texts = [seg["text"]]
+        prev_end = seg["end"]
+
+    prefix = f"{cur_label}: " if cur_label else ""
+    paragraphs.append(prefix + " ".join(cur_texts))
+    return "\n\n".join(paragraphs)
 
 
 def correct_transcription(text: str, meeting_title: str = "", agenda_list: str = "",
@@ -215,7 +324,10 @@ def correct_transcription(text: str, meeting_title: str = "", agenda_list: str =
 - 없는 내용을 지어내지 말 것. 못 알아듣는 부분은 원문 그대로 둘 것.
 - "회의 제목:", "안건:", "Q:", "A:", "■", "**굵게**", "#", "-목록" 등
   어떤 제목·라벨·머리말·마크다운 서식도 추가 금지. 아래 [참고 정보]를 본문에 옮겨 적지 말 것.
-- 화자 이름이나 "화자1:" 같은 발화자 표시도 새로 만들지 말 것.
+- 원문 각 줄이 "화자1:", "화자2:" 같은 화자 라벨로 시작한다면, 이는 음성 기반
+  화자분리 결과이니 그대로 보존할 것. 라벨을 새로 만들거나, 지우거나, 번호를
+  바꾸거나, 서로 다른 화자의 줄을 하나로 합치지 말 것. 라벨 뒤 본문 내용만
+  위 규칙대로 오타 교정한다.
 
 [출력]
 - 교정된 본문만 출력. 설명·머리말 없이, 원문과 거의 동일한 분량으로.
@@ -372,10 +484,10 @@ def _run_transcription(meeting_id: int, transcript_id: int):
                                     size // (1024 * 1024), csize // (1024 * 1024),
                                     time.monotonic() - t0)
                         if csize <= CHUNK_THRESHOLD:
-                            raw_text = _transcribe_one(compact, whisper_prompt)
+                            segments = _transcribe_one(compact, whisper_prompt)
                         else:
                             logger.info("재인코딩 후도 큼 → 분할 변환")
-                            raw_text = _transcribe_large(compact, whisper_prompt)
+                            segments = _transcribe_large(compact, whisper_prompt)
                     finally:
                         try:
                             os.remove(compact)
@@ -384,9 +496,9 @@ def _run_transcription(meeting_id: int, transcript_id: int):
                 else:
                     # ffmpeg 미설치/실패 → 기존 분할 경로로 폴백
                     logger.info("컴팩트 재인코딩 불가 → 분할 변환")
-                    raw_text = _transcribe_large(audio_path, whisper_prompt)
+                    segments = _transcribe_large(audio_path, whisper_prompt)
             else:
-                raw_text = _transcribe_one(audio_path, whisper_prompt)
+                segments = _transcribe_one(audio_path, whisper_prompt)
             logger.info("STT 완료 (%.1fs, meeting %s)", time.monotonic() - t0, meeting_id)
         except Exception as e:
             logger.exception("Whisper STT 실패")
@@ -394,6 +506,31 @@ def _run_transcription(meeting_id: int, transcript_id: int):
             transcript.process_error = f"음성 인식 실패: {e}"
             db.commit()
             return
+
+        if not segments:
+            transcript.process_status = "failed"
+            transcript.process_error = "음성에서 텍스트를 추출하지 못했습니다 (무음이거나 너무 짧음)."
+            db.commit()
+            return
+
+        # 화자분리 — 오디오에서 실제로 "누가 언제 말했는지" 구분한다(텍스트 추측이 아님).
+        # 실패해도(HF_TOKEN 없음 등) 화자 라벨 없이 진행할 뿐 STT 자체는 그대로 성공시킨다.
+        td = time.monotonic()
+        speaker_segments = None
+        diar_wav = _diarization_wav(audio_path)
+        if diar_wav:
+            try:
+                speaker_segments = diarize(diar_wav)
+                n_speakers = len({s[2] for s in speaker_segments}) if speaker_segments else 0
+                logger.info("화자분리 완료 (%.1fs, meeting %s, 화자 %d명)",
+                            time.monotonic() - td, meeting_id, n_speakers)
+            finally:
+                try:
+                    os.remove(diar_wav)
+                except OSError:
+                    pass
+
+        raw_text = _compose_transcript(segments, speaker_segments)
 
         if not raw_text:
             transcript.process_status = "failed"

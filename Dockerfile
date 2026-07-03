@@ -6,6 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends fonts-nanum ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# torch는 CPU 전용 휠을 먼저 깔아둔다 (화자분리용 pyannote.audio 의존성).
+# 기본 PyPI 인덱스로 깔면 GPU(CUDA) 런타임이 딸려와 이미지가 수 GB 커지는데,
+# 이 서버는 GPU가 없어 무의미하다 → CPU 인덱스로 고정.
+RUN pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
 # 의존성 먼저 설치 (레이어 캐시 활용)
 COPY backend/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
